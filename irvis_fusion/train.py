@@ -24,7 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-steps-per-epoch", type=int, default=0)
-    parser.add_argument("--max-iterations", type=int, default=3)
+    parser.add_argument("--detector-backend", default="yolo_like", choices=["yolo_like", "ultralytics"])
+    parser.add_argument("--yolo-weights", default=None)
+    parser.add_argument("--yolo-imgsz", type=int, default=640)
     parser.add_argument("--fusion-weight", type=float, default=1.0)
     parser.add_argument("--detection-weight", type=float, default=1.0)
     parser.add_argument("--no-sam", action="store_true")
@@ -69,14 +71,17 @@ def main() -> None:
 
     model = IRVISFusionDetectionNet(
         num_classes=args.num_classes,
-        max_iterations=args.max_iterations,
         use_sam=not args.no_sam,
         use_feedback=not args.no_feedback,
+        detector_backend=args.detector_backend,
+        yolo_weights=args.yolo_weights,
+        yolo_imgsz=args.yolo_imgsz,
     ).to(device)
     criterion = JointFusionDetectionLoss(
         num_classes=args.num_classes,
         fusion_weight=args.fusion_weight,
         detection_weight=args.detection_weight,
+        use_feedback=not args.no_feedback,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
@@ -99,7 +104,14 @@ def main() -> None:
                 targets=targets,
                 return_logs=True,
             )
-            losses = criterion(outputs, ir, vis, sam, targets)
+            losses = criterion(
+                outputs,
+                ir,
+                vis,
+                sam,
+                targets,
+                use_feedback=not args.no_feedback,
+            )
             loss = losses["loss"]
 
             optimizer.zero_grad(set_to_none=True)
@@ -110,17 +122,17 @@ def main() -> None:
             global_step += 1
             running_loss += float(loss.item())
             if step == 1 or step % 20 == 0:
-                last_log = outputs["iteration_logs"][-1]
                 print(
                     "epoch={:03d} step={:05d} loss={:.4f} fusion={:.4f} "
-                    "det={:.4f} recall={:.3f} conf={:.3f}".format(
+                    "det={:.4f} lambda_det={:.3f} recall={:.3f} conf={:.3f}".format(
                         epoch,
                         step,
                         float(losses["loss"].item()),
                         float(losses["fusion_loss"].item()),
                         float(losses["detection_loss"].item()),
-                        last_log["recall"],
-                        last_log["mean_confidence"],
+                        float(losses["lambda_det"].item()),
+                        float(losses["detection_recall"].item()),
+                        float(losses["detection_confidence"].item()),
                     )
                 )
 

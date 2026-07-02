@@ -1,4 +1,4 @@
-"""IR-VIS fusion with SAM-guided detection feedback."""
+"""SDIF-Net for IR/VIS fusion with detection-guided training."""
 
 from .models.network import IRVISFusionDetectionNet
 

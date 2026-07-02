@@ -1,18 +1,19 @@
-# IR-VIS Fusion with SAM-guided Detection Feedback Iterative Network
+# SDIF-Net: SAM-guided Detection-aware IR-VIS Fusion
 
 This project implements a trainable PyTorch pipeline for infrared-visible image
-fusion and YOLO-style detection feedback.
+fusion and detection-guided optimization.
 
 ## What Is Included
 
 - independent IR and VIS CNN encoders
 - FPN top-down multi-scale enhancement
-- `SAMPriorEncoder` for SAM mask attention
-- three-level fusion: detail, semantic interaction, and target-aware feedback
+- `SAMPriorEncoder` for a soft SAM attention prior
+- unified three-scale SDIF fusion over FPN features
 - FPN-style decoder that reconstructs `I_fused`
 - compact YOLO-like dense detection head
-- detection feedback loop that builds `M_miss`, uncertainty `U`, and `G_fb`
-- ablation switches: `use_sam`, `use_feedback`, `max_iterations`
+- optional Ultralytics YOLO11 inference wrapper
+- detection feedback as a dynamic detection-loss weight
+- ablation switches: `use_sam`, `use_feedback`, `detector_backend`
 
 ## Data Layout
 
@@ -36,8 +37,8 @@ Labels are YOLO normalized `class cx cy w h`.
 python -m irvis_fusion.smoke_test
 ```
 
-The smoke test runs dynamic-size forward, two feedback iterations, detection
-loss, fusion loss, and backward propagation.
+The smoke test runs dynamic-size forward, fusion loss, detection loss, dynamic
+detection weighting, and backward propagation.
 
 ## Train
 
@@ -47,8 +48,7 @@ python -m irvis_fusion.train ^
   --image-size 256 320 ^
   --batch-size 2 ^
   --epochs 20 ^
-  --num-classes 6 ^
-  --max-iterations 3
+  --num-classes 6
 ```
 
 Disable modules for ablation:
@@ -56,7 +56,7 @@ Disable modules for ablation:
 ```bash
 python -m irvis_fusion.train --no-sam
 python -m irvis_fusion.train --no-feedback
-python -m irvis_fusion.train --max-iterations 1
+python -m irvis_fusion.train --detector-backend ultralytics
 ```
 
 ## Main Output Keys
@@ -66,13 +66,17 @@ python -m irvis_fusion.train --max-iterations 1
 - `I_fused`: reconstructed fused image
 - `detections`: raw and decoded YOLO-like predictions
 - `fused_features`: level1, level2, level3 fused features
-- `feedback`: `M_miss`, `U`, `G_fb`, recall, and confidence
-- `iteration_logs`: per-iteration recall/confidence summaries
+- `sam_attention`: soft SAM prior `A_sam`
+- `forward_logs`: confirms the single-pass SDIF pipeline
 
-## Replacing The Detector
+## Detector Backends
 
-`irvis_fusion/models/detector.py` is intentionally a small YOLO-style head. For
-paper experiments with a full detector, keep its return contract:
+The default `yolo_like` backend is trainable end-to-end. The `ultralytics`
+backend uses `irvis_fusion/models/yolo11n.pt` by default and is suitable for
+inference-time detection/feedback metrics, but Ultralytics NMS is not used as a
+differentiable detection loss.
+
+Both backends keep this return contract:
 
 ```python
 {
@@ -85,4 +89,12 @@ paper experiments with a full detector, keep its return contract:
 }
 ```
 
-The feedback module and detection loss consume only the decoded fields.
+The loss consumes decoded fields and computes:
+
+```text
+L_total = L_fusion + lambda_det * L_detection
+```
+
+When `use_feedback=True`, `lambda_det` increases for low recall or low detection
+confidence. Detection feedback is used only in the loss path and does not enter
+the forward feature path.

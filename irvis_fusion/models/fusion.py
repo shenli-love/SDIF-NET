@@ -4,70 +4,29 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .blocks import ConvBNAct, DepthwiseSeparableConv
+from .blocks import ConvBNAct
 
 
-class DetailFusionBlock(nn.Module):
-    """Level-1 detail fusion that highlights texture and local contrast."""
+class SDIFScaleFusion(nn.Module):
+    """Single-scale SDIF fusion with SAM as an attention-logit bias.
 
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.edge_proj = ConvBNAct(channels, channels, kernel_size=1)
-        self.fuse = nn.Sequential(
-            ConvBNAct(channels * 3, channels),
-            DepthwiseSeparableConv(channels, channels),
-        )
-
-    def forward(self, ir: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
-        detail = self.edge_proj(torch.abs(ir - vis))
-        return self.fuse(torch.cat([ir, vis, detail], dim=1))
-
-
-class CrossModalInteraction(nn.Module):
-    """Lightweight spatial/channel interaction between two modalities."""
+    SAM is not used as a hard feature gate. The soft prior only shifts the
+    cross-modal attention logits, allowing the model to learn when and how much
+    the prior should matter.
+    """
 
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.gate = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=True),
-            nn.Sigmoid(),
+        self.ir_proj = ConvBNAct(channels, channels, kernel_size=1)
+        self.vis_proj = ConvBNAct(channels, channels, kernel_size=1)
+        self.attn_logits = nn.Conv2d(channels * 2, channels, kernel_size=1)
+        self.sam_bias = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1),
+            nn.Tanh(),
         )
-        self.refine = nn.Sequential(
-            ConvBNAct(channels * 2, channels),
+        self.mix = nn.Sequential(
+            ConvBNAct(channels * 3, channels, kernel_size=1),
             ConvBNAct(channels, channels),
-        )
-
-    def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        gate = self.gate(torch.cat([query, context, torch.abs(query - context)], dim=1))
-        attended = query + gate * context
-        return self.refine(torch.cat([attended, context], dim=1))
-
-
-class SemanticFusionBlock(nn.Module):
-    """Level-2 bidirectional semantic interaction."""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.ir_to_vis = CrossModalInteraction(channels)
-        self.vis_to_ir = CrossModalInteraction(channels)
-        self.out = ConvBNAct(channels * 2, channels)
-
-    def forward(self, ir: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
-        a = self.ir_to_vis(ir, vis)
-        b = self.vis_to_ir(vis, ir)
-        return self.out(torch.cat([a, b], dim=1))
-
-
-class TargetFusionBlock(nn.Module):
-    """Level-3 target fusion with SAM and detection feedback guidance."""
-
-    def __init__(self, channels: int, init_feedback_lambda: float = 0.5) -> None:
-        super().__init__()
-        self.ir_to_vis = CrossModalInteraction(channels)
-        self.vis_to_ir = CrossModalInteraction(channels)
-        self.refine = ConvBNAct(channels, channels)
-        self.feedback_lambda = nn.Parameter(
-            torch.tensor(float(init_feedback_lambda), dtype=torch.float32)
         )
 
     def forward(
@@ -75,52 +34,48 @@ class TargetFusionBlock(nn.Module):
         ir: torch.Tensor,
         vis: torch.Tensor,
         sam_attention: torch.Tensor | None = None,
-        feedback: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        fused = self.ir_to_vis(ir, vis) + self.vis_to_ir(vis, ir)
-        weight = torch.ones(
-            fused.shape[0],
-            1,
-            fused.shape[-2],
-            fused.shape[-1],
-            device=fused.device,
-            dtype=fused.dtype,
-        )
+        ir_feat = self.ir_proj(ir)
+        vis_feat = self.vis_proj(vis)
+        logits = self.attn_logits(torch.cat([ir_feat, vis_feat], dim=1))
         if sam_attention is not None:
-            weight = F.interpolate(
+            sam = F.interpolate(
                 sam_attention,
-                size=fused.shape[-2:],
+                size=logits.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             )
-        if feedback is not None:
-            feedback = F.interpolate(
-                feedback,
-                size=fused.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            weight = weight + self.feedback_lambda.clamp(min=0.0) * feedback
-        return self.refine(weight * fused)
+            logits = logits + self.sam_bias(sam)
+        alpha = torch.sigmoid(logits)
+        cross_modal = alpha * ir_feat + (1.0 - alpha) * vis_feat
+        complement = (1.0 - alpha) * ir_feat + alpha * vis_feat
+        contrast = torch.abs(ir_feat - vis_feat)
+        return self.mix(torch.cat([cross_modal, complement, contrast], dim=1))
 
 
-class MultiLevelFusion(nn.Module):
-    """Three-level fusion: details, semantics, and target-aware fusion."""
+class SDIFUnifiedFusion(nn.Module):
+    """Unified three-scale SDIF fusion function.
 
-    def __init__(self, channels: int = 128, init_feedback_lambda: float = 0.5) -> None:
+    F_fuse = f(F_ir, F_vis, A_sam)
+
+    Detection feedback is intentionally absent from this forward path. It is
+    handled by the training objective as a dynamic detection-loss weight.
+    """
+
+    def __init__(self, channels: int = 128, num_scales: int = 3) -> None:
         super().__init__()
-        self.level1 = DetailFusionBlock(channels)
-        self.level2 = SemanticFusionBlock(channels)
-        self.level3 = TargetFusionBlock(channels, init_feedback_lambda)
+        self.scales = nn.ModuleList([SDIFScaleFusion(channels) for _ in range(num_scales)])
 
     def forward(
         self,
         ir_features: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         vis_features: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         sam_attention: torch.Tensor | None = None,
-        feedback: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        f1 = self.level1(ir_features[0], vis_features[0])
-        f2 = self.level2(ir_features[1], vis_features[1])
-        f3 = self.level3(ir_features[2], vis_features[2], sam_attention, feedback)
-        return f1, f2, f3
+        if len(ir_features) != len(vis_features) or len(ir_features) != len(self.scales):
+            raise ValueError("SDIFUnifiedFusion expects three aligned FPN scales.")
+        fused = [
+            block(ir, vis, sam_attention)
+            for block, ir, vis in zip(self.scales, ir_features, vis_features)
+        ]
+        return tuple(fused)  # type: ignore[return-value]

@@ -15,9 +15,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=191)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-classes", type=int, default=6)
-    parser.add_argument("--max-iterations", type=int, default=2)
     parser.add_argument("--no-sam", action="store_true")
     parser.add_argument("--no-feedback", action="store_true")
+    parser.add_argument("--detector-backend", default="yolo_like", choices=["yolo_like", "ultralytics"])
     return parser.parse_args()
 
 
@@ -47,13 +47,16 @@ def main() -> None:
 
     model = IRVISFusionDetectionNet(
         num_classes=args.num_classes,
-        max_iterations=args.max_iterations,
         use_sam=not args.no_sam,
         use_feedback=not args.no_feedback,
+        detector_backend=args.detector_backend,
     ).to(device)
-    criterion = JointFusionDetectionLoss(num_classes=args.num_classes)
+    criterion = JointFusionDetectionLoss(
+        num_classes=args.num_classes,
+        use_feedback=not args.no_feedback,
+    )
     outputs = model(ir, vis, sam_mask=sam, targets=targets)
-    losses = criterion(outputs, ir, vis, sam, targets)
+    losses = criterion(outputs, ir, vis, sam, targets, use_feedback=not args.no_feedback)
     losses["loss"].backward()
 
     print("smoke_test=ok")
@@ -65,7 +68,10 @@ def main() -> None:
     )
     print(f"pred_boxes={tuple(outputs['detections']['decoded']['boxes'].shape)}")
     print(f"loss={float(losses['loss'].item()):.4f}")
-    print(f"iteration_logs={outputs['iteration_logs']}")
+    print(f"lambda_det={float(losses['lambda_det'].item()):.4f}")
+    print(f"detection_recall={float(losses['detection_recall'].item()):.4f}")
+    print(f"detection_confidence={float(losses['detection_confidence'].item()):.4f}")
+    print(f"forward_logs={outputs['forward_logs']}")
 
 
 if __name__ == "__main__":

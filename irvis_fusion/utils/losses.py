@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..models.feedback import DetectionFeedbackLossWeight
 from .boxes import box_iou, cxcywh_to_xyxy, xyxy_to_cxcywh
 
 
@@ -151,12 +152,15 @@ class JointFusionDetectionLoss(nn.Module):
         num_classes: int,
         fusion_weight: float = 1.0,
         detection_weight: float = 1.0,
+        use_feedback: bool = True,
     ) -> None:
         super().__init__()
         self.fusion_weight = fusion_weight
         self.detection_weight = detection_weight
+        self.use_feedback = use_feedback
         self.fusion_loss = FusionReconstructionLoss()
         self.detection_loss = YOLOLikeDetectionLoss(num_classes=num_classes)
+        self.feedback_weight = DetectionFeedbackLossWeight(base_lambda=detection_weight)
 
     def forward(
         self,
@@ -165,11 +169,13 @@ class JointFusionDetectionLoss(nn.Module):
         vis: torch.Tensor,
         sam_mask: torch.Tensor | None,
         targets: list[dict[str, torch.Tensor]],
+        use_feedback: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         fusion_terms = self.fusion_loss(outputs["I_fused"], ir, vis, sam_mask)
+        decoded = outputs["detections"]["decoded"]
         if outputs["detections"].get("trainable", True):
             detection_terms = self.detection_loss(
-                outputs["detections"]["decoded"],
+                decoded,
                 targets,
             )
         else:
@@ -182,8 +188,20 @@ class JointFusionDetectionLoss(nn.Module):
                 "noobj_loss": zero,
                 "positive_count": zero,
             }
+        enabled = self.use_feedback if use_feedback is None else use_feedback
+        feedback_terms = self.feedback_weight(
+            decoded,
+            targets,
+            enabled=enabled,
+        )
+        lambda_det = feedback_terms["lambda_det"]
         total = (
             self.fusion_weight * fusion_terms["fusion_loss"]
-            + self.detection_weight * detection_terms["detection_loss"]
+            + lambda_det * detection_terms["detection_loss"]
         )
-        return {"loss": total, **fusion_terms, **detection_terms}
+        return {
+            "loss": total,
+            **fusion_terms,
+            **detection_terms,
+            **feedback_terms,
+        }

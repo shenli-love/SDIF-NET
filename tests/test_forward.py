@@ -20,7 +20,7 @@ def test_forward_backward_dynamic_shape() -> None:
         }
         for _ in range(batch_size)
     ]
-    model = IRVISFusionDetectionNet(num_classes=6, max_iterations=2)
+    model = IRVISFusionDetectionNet(num_classes=6)
     criterion = JointFusionDetectionLoss(num_classes=6)
     outputs = model(ir, vis, sam_mask=sam, targets=targets)
     losses = criterion(outputs, ir, vis, sam, targets)
