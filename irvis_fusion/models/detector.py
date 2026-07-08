@@ -52,7 +52,7 @@ class UltralyticsYOLODetector(nn.Module):
 
     @torch.no_grad()
     def forward(self, image: torch.Tensor) -> dict[str, object]:
-        image_for_yolo = self._prepare_image(image)
+        image_for_yolo, restore_scale = self._prepare_image(image)
         results = self.yolo.predict(
             source=image_for_yolo,
             imgsz=self.imgsz,
@@ -63,22 +63,35 @@ class UltralyticsYOLODetector(nn.Module):
             verbose=False,
             device=str(image.device),
         )
-        decoded = self._results_to_decoded(results, image.device, image.dtype)
+        decoded = self._results_to_decoded(
+            results,
+            image.device,
+            image.dtype,
+            restore_scale,
+        )
         return {"raw": results, "decoded": decoded, "trainable": False}
 
-    def _prepare_image(self, image: torch.Tensor) -> torch.Tensor:
+    def _prepare_image(self, image: torch.Tensor) -> tuple[torch.Tensor, tuple[float, float]]:
         image = image.detach().float().clamp(0.0, 1.0)
         if image.shape[1] == 1:
             image = image.repeat(1, 3, 1, 1)
         elif image.shape[1] > 3:
             image = image[:, :3]
-        return image
+        _, _, height, width = image.shape
+        pad_h = (-height) % 32
+        pad_w = (-width) % 32
+        if pad_h or pad_w:
+            image = F.pad(image, (0, pad_w, 0, pad_h))
+        padded_h, padded_w = image.shape[-2:]
+        restore_scale = (padded_w / width, padded_h / height)
+        return image, restore_scale
 
     def _results_to_decoded(
         self,
         results: list[object],
         device: torch.device,
         dtype: torch.dtype,
+        restore_scale: tuple[float, float],
     ) -> dict[str, torch.Tensor]:
         batch_size = len(results)
         boxes = torch.zeros(
@@ -101,6 +114,10 @@ class UltralyticsYOLODetector(nn.Module):
                 continue
             n = min(result_boxes.xyxyn.shape[0], self.max_det)
             cur_boxes = result_boxes.xyxyn[:n].to(device=device, dtype=dtype)
+            scale = cur_boxes.new_tensor(
+                [restore_scale[0], restore_scale[1], restore_scale[0], restore_scale[1]]
+            )
+            cur_boxes = cur_boxes * scale
             cur_scores = result_boxes.conf[:n].to(device=device, dtype=dtype)
             cur_labels = result_boxes.cls[:n].to(device=device, dtype=torch.long)
             boxes[batch_idx, :n] = cur_boxes.clamp(0.0, 1.0)
@@ -186,7 +203,7 @@ class YOLOLikeHead(nn.Module):
         p5 = self.p5(p4)
         raw = [head(feat) for head, feat in zip(self.heads, (p3, p4, p5))]
         decoded = self.decode(raw)
-        return {"raw": raw, "decoded": decoded}
+        return {"raw": raw, "decoded": decoded, "trainable": True}
 
     def decode(self, raw_outputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         boxes_all: list[torch.Tensor] = []
@@ -204,7 +221,8 @@ class YOLOLikeHead(nn.Module):
             )
             grid = torch.stack((gx, gy), dim=-1).view(1, h, w, 2)
             xy = (torch.sigmoid(pred[..., 0:2]) + grid) / pred.new_tensor([w, h])
-            wh = torch.sigmoid(pred[..., 2:4]).pow(2.0)
+            cell_size = pred.new_tensor([1.0 / w, 1.0 / h])
+            wh = (F.softplus(pred[..., 2:4]) + 1e-4) * cell_size
             boxes = cxcywh_to_xyxy(torch.cat([xy, wh], dim=-1).view(b, -1, 4))
             boxes = boxes.clamp(0.0, 1.0)
             obj = torch.sigmoid(pred[..., 4]).view(b, -1)

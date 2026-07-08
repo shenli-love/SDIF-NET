@@ -19,4 +19,5 @@ class SAMPriorEncoder(nn.Module):
     def forward(self, sam_mask: torch.Tensor) -> torch.Tensor:
         if sam_mask.dim() == 3:
             sam_mask = sam_mask.unsqueeze(1)
-        return self.net(sam_mask.float().clamp(0.0, 1.0))
+        sam_mask = sam_mask.float().clamp(0.0, 1.0)
+        return self.net(sam_mask) * sam_mask

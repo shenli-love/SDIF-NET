@@ -4,30 +4,79 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .blocks import ConvBNAct
 
+class SAMQKVFusion(nn.Module):
+    """Small-target-aware SAM-QKV cross-modal attention.
 
-class SDIFScaleFusion(nn.Module):
-    """Single-scale SDIF fusion with SAM as an attention-logit bias.
-
-    SAM is not used as a hard feature gate. The soft prior only shifts the
-    cross-modal attention logits, allowing the model to learn when and how much
-    the prior should matter.
+    SAM is embedded as a soft spatial prior before Q/K/V projection. Attention
+    combines local-window contrast and global context so sparse distant targets
+    are not suppressed by a full-image softmax. A lightweight modality gate
+    increases IR contribution in locally salient thermal regions.
     """
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, local_windows: tuple[int, ...] = (3, 7, 11)) -> None:
         super().__init__()
-        self.ir_proj = ConvBNAct(channels, channels, kernel_size=1)
-        self.vis_proj = ConvBNAct(channels, channels, kernel_size=1)
-        self.attn_logits = nn.Conv2d(channels * 2, channels, kernel_size=1)
-        self.sam_bias = nn.Sequential(
+        self.scale = channels ** -0.5
+        self.local_windows = local_windows
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.sam_embed = nn.Sequential(
             nn.Conv2d(1, channels, kernel_size=1),
-            nn.Tanh(),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1),
         )
-        self.mix = nn.Sequential(
-            ConvBNAct(channels * 3, channels, kernel_size=1),
-            ConvBNAct(channels, channels),
+        self.local_global_mix = nn.Parameter(torch.tensor(1.0))
+        self.ir_prior_strength = nn.Parameter(torch.tensor(0.5))
+        self.modality_gate = nn.Sequential(
+            nn.Conv2d(4, 16, kernel_size=1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
         )
+        self.base_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.out = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+        self.norm=nn.InstanceNorm2d(channels)
+
+    def _hybrid_attention(self, score: torch.Tensor) -> torch.Tensor:
+        local_maps = []
+        for window in self.local_windows:
+            local_score = F.max_pool2d(
+                score,
+                kernel_size=window,
+                stride=1,
+                padding=window // 2,
+            )
+            local_maps.append(torch.sigmoid(local_score))
+
+        local_attn = torch.stack(local_maps, dim=0).mean(dim=0)
+        global_attn = torch.sigmoid(score.mean(dim=(-2, -1), keepdim=True))
+        local_weight = torch.sigmoid(self.local_global_mix)
+
+        return local_weight * local_attn + (1.0 - local_weight) * global_attn
+
+    def _ir_modality_weight(
+        self,
+        ir_cond: torch.Tensor,
+        vis_cond: torch.Tensor,
+        sam_focus: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ir_energy = ir_cond.abs().mean(dim=1, keepdim=True)
+        vis_energy = vis_cond.abs().mean(dim=1, keepdim=True)
+        diff_energy = (ir_cond - vis_cond).abs().mean(dim=1, keepdim=True)
+        if sam_focus is None:
+            sam_focus = ir_energy.new_zeros(ir_energy.shape)
+
+        gate_logits = self.modality_gate(
+            torch.cat([ir_energy, vis_energy, diff_energy, sam_focus], dim=1)
+        )
+        # 【修改点】移除了 local_ir_mean 和 local_ir_saliency，避免边缘过度加权
+        thermal_advantage = torch.tanh(ir_energy - vis_energy)
+        ir_bias = self.ir_prior_strength * thermal_advantage
+        return torch.sigmoid(gate_logits + ir_bias)
 
     def forward(
         self,
@@ -35,26 +84,46 @@ class SDIFScaleFusion(nn.Module):
         vis: torch.Tensor,
         sam_attention: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ir_feat = self.ir_proj(ir)
-        vis_feat = self.vis_proj(vis)
-        logits = self.attn_logits(torch.cat([ir_feat, vis_feat], dim=1))
+        _, _, h, w = ir.shape
         if sam_attention is not None:
             sam = F.interpolate(
                 sam_attention,
-                size=logits.shape[-2:],
+                size=(h, w),
                 mode="bilinear",
                 align_corners=False,
-            )
-            logits = logits + self.sam_bias(sam)
-        alpha = torch.sigmoid(logits)
-        cross_modal = alpha * ir_feat + (1.0 - alpha) * vis_feat
-        complement = (1.0 - alpha) * ir_feat + alpha * vis_feat
-        contrast = torch.abs(ir_feat - vis_feat)
-        return self.mix(torch.cat([cross_modal, complement, contrast], dim=1))
+            ).clamp(0.0, 1.0)
+            sam_prior = self.sam_embed(sam) * sam
+        else:
+            sam = None
+            sam_prior = ir.new_zeros(ir.shape)
+
+        ir_cond = ir + sam_prior
+        vis_cond = vis + sam_prior
+
+        q_ir = self.q_proj(ir_cond)
+        k_vis = self.k_proj(vis_cond)
+        v_vis = self.v_proj(vis_cond)
+
+        q_vis = self.q_proj(vis_cond)
+        k_ir = self.k_proj(ir_cond)
+        v_ir = self.v_proj(ir_cond)
+
+        score_ir_to_vis = (q_ir * k_vis).sum(dim=1, keepdim=True) * self.scale
+        score_vis_to_ir = (q_vis * k_ir).sum(dim=1, keepdim=True) * self.scale
+        attn_ir_to_vis = self._hybrid_attention(score_ir_to_vis)
+        attn_vis_to_ir = self._hybrid_attention(score_vis_to_ir)
+
+        ir_weight = self._ir_modality_weight(ir_cond, vis_cond, sam)
+        cross_vis = attn_ir_to_vis * v_vis
+        cross_ir = attn_vis_to_ir * v_ir
+        base = self.base_proj(ir_weight * ir_cond + (1.0 - ir_weight) * vis_cond)
+        fused = base + ir_weight * cross_ir + (1.0 - ir_weight) * cross_vis
+        fused = self.norm(fused)
+        return self.out(fused)
 
 
-class SDIFUnifiedFusion(nn.Module):
-    """Unified three-scale SDIF fusion function.
+class SAMQKVUnifiedFusion(nn.Module):
+    """Three-scale wrapper around SAM-QKV fusion.
 
     F_fuse = f(F_ir, F_vis, A_sam)
 
@@ -64,7 +133,9 @@ class SDIFUnifiedFusion(nn.Module):
 
     def __init__(self, channels: int = 128, num_scales: int = 3) -> None:
         super().__init__()
-        self.scales = nn.ModuleList([SDIFScaleFusion(channels) for _ in range(num_scales)])
+        self.operators = nn.ModuleList(
+            [SAMQKVFusion(channels) for _ in range(num_scales)]
+        )
 
     def forward(
         self,
@@ -72,10 +143,10 @@ class SDIFUnifiedFusion(nn.Module):
         vis_features: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         sam_attention: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if len(ir_features) != len(vis_features) or len(ir_features) != len(self.scales):
-            raise ValueError("SDIFUnifiedFusion expects three aligned FPN scales.")
+        if len(ir_features) != len(vis_features) or len(ir_features) != len(self.operators):
+            raise ValueError("SAMQKVUnifiedFusion expects three aligned FPN scales.")
         fused = [
-            block(ir, vis, sam_attention)
-            for block, ir, vis in zip(self.scales, ir_features, vis_features)
+            operator(ir, vis, sam_attention)
+            for operator, ir, vis in zip(self.operators, ir_features, vis_features)
         ]
         return tuple(fused)  # type: ignore[return-value]

@@ -54,7 +54,7 @@ class M3FDDataset(Dataset):
         self,
         root: str | Path = "datasets/M3FD_Detection",
         split: str = "train",
-        image_size: tuple[int, int] | None = (256, 320),
+        image_size: tuple[int, int] | None = (768, 1024),
         ir_dir: str = "ir",
         vis_dir: str = "vi",
         sam_dir: str = "sam_masks",

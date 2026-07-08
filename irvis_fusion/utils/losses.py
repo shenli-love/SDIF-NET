@@ -16,40 +16,229 @@ def gradient_map(x: torch.Tensor) -> torch.Tensor:
     return dx + dy
 
 
-class FusionReconstructionLoss(nn.Module):
-    """Intensity and gradient losses for infrared-visible fusion."""
+def laplacian_map(x: torch.Tensor) -> torch.Tensor:
+    kernel = x.new_tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]])
+    kernel = kernel.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+    return torch.abs(F.conv2d(x, kernel, padding=1, groups=x.shape[1]))
 
-    def __init__(self, intensity_weight: float = 1.0, gradient_weight: float = 5.0) -> None:
+
+def ssim_loss(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    pad = window_size // 2
+    c1 = 0.01**2
+    c2 = 0.03**2
+    mu_x = F.avg_pool2d(x, window_size, stride=1, padding=pad)
+    mu_y = F.avg_pool2d(y, window_size, stride=1, padding=pad)
+    mu_x_sq = mu_x.pow(2)
+    mu_y_sq = mu_y.pow(2)
+    mu_xy = mu_x * mu_y
+    sigma_x = F.avg_pool2d(x * x, window_size, stride=1, padding=pad) - mu_x_sq
+    sigma_y = F.avg_pool2d(y * y, window_size, stride=1, padding=pad) - mu_y_sq
+    sigma_xy = F.avg_pool2d(x * y, window_size, stride=1, padding=pad) - mu_xy
+    numerator = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
+    denominator = (mu_x_sq + mu_y_sq + c1) * (sigma_x + sigma_y + c2)
+    ssim = numerator / denominator.clamp_min(1e-6)
+    return 1.0 - ssim.clamp(0.0, 1.0).mean()
+
+
+def multiscale_structure_loss(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scales: tuple[int, ...] = (1, 2, 4),
+) -> torch.Tensor:
+    loss = x.new_tensor(0.0)
+    valid_scales = 0
+    for scale in scales:
+        if scale > 1:
+            if min(x.shape[-2:]) < scale:
+                continue
+            cur_x = F.avg_pool2d(x, kernel_size=scale, stride=scale)
+            cur_y = F.avg_pool2d(y, kernel_size=scale, stride=scale)
+        else:
+            cur_x = x
+            cur_y = y
+        loss = loss + F.l1_loss(gradient_map(cur_x), gradient_map(cur_y))
+        loss = loss + 0.5 * F.l1_loss(laplacian_map(cur_x), laplacian_map(cur_y))
+        valid_scales += 1
+    return loss / max(valid_scales, 1)
+
+
+def weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return (value * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+class DetectionAwareFusionLoss(nn.Module):
+    """Fusion loss with GT-box spatial weighting for detection-aware training."""
+
+    def __init__(
+        self,
+        intensity_weight: float = 0.1,
+        gradient_weight: float = 1.0,
+        object_region_weight: float = 0.5,
+        sam_weight: float = 1.0,
+        ssim_weight: float = 0.5,
+        perceptual_weight: float = 0.2,
+        # target_max_weight: float = 1,
+        excess_weight: float = 0.35,
+        flat_smoothness_weight: float = 0.0,
+        ring_artifact_weight: float = 0.25,
+        excess_margin: float = 0.03,
+        flat_gradient_threshold: float = 0.001,
+        ring_width: int = 15,
+    ) -> None:
         super().__init__()
         self.intensity_weight = intensity_weight
         self.gradient_weight = gradient_weight
+        self.object_region_weight = object_region_weight
+        self.sam_weight = sam_weight
+        self.ssim_weight = ssim_weight
+        self.perceptual_weight = perceptual_weight
+        # self.target_max_weight = target_max_weight
+        self.excess_weight = excess_weight
+        self.flat_smoothness_weight = flat_smoothness_weight
+        self.ring_artifact_weight = ring_artifact_weight
+        self.excess_margin = excess_margin
+        self.flat_gradient_threshold = flat_gradient_threshold
+        self.ring_width = ring_width
 
     def forward(
         self,
         fused: torch.Tensor,
         ir: torch.Tensor,
         vis: torch.Tensor,
+        targets: list[dict[str, torch.Tensor]],
         sam_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        target_intensity = torch.maximum(ir, vis)
-        intensity = F.l1_loss(fused, target_intensity)
-        target_grad = torch.maximum(gradient_map(ir), gradient_map(vis))
-        gradient = F.l1_loss(gradient_map(fused), target_grad)
+        # ================= 1. 计算纹理能量 =================
+        # 先计算梯度图代表纹理能量
+        ir_grad = gradient_map(ir)
+        vis_grad = gradient_map(vis)
+        
+        # 构造二值硬掩码 (不引入任何像素平均！)
+        # texture_ratio 越接近 0 或 1，过渡越平滑，我们先让它接近二值
+        texture_ratio = torch.sigmoid((ir_grad - vis_grad) * 20.0)  
+        texture_mask = (texture_ratio > 0.5).float()  # 强行二值化，绝不妥协混合
+        
+        # ================= 2. 构建“纹理优势参考图” =================
+        # 这块图里每一个像素要么是 IR，要么是 VIS，绝对不会产生加权平均的灰度
+        target_struct_img = texture_mask * ir + (1.0 - texture_mask) * vis
+        
+        # 保留 max_intensity 仅用于抑制过曝，不做训练目标！
+        max_intensity = torch.maximum(ir, vis)
+
+        # ================= 3. 结构损失和感知损失 =================
+        # 直接对比融合图与“纹理优势参考图”，彻底代替之前死板的 ir
+        gradient = F.l1_loss(gradient_map(fused), torch.maximum(ir_grad, vis_grad)) # 这里是梯度最大保留
+        structure = ssim_loss(fused, target_struct_img)
+        perceptual = multiscale_structure_loss(fused, target_struct_img)
+
+        intensity = F.l1_loss(fused, target_struct_img)
+
+        # ================= 4. 目标区域加权损失 =================
+        object_weight_map = self._build_weight_map(targets, fused.shape, fused.device, fused.dtype)
+        abs_error = (fused - target_struct_img).abs()  # 目标区域比对纹理优势图
+        object_region = fused.new_tensor(0.0)
+        if object_weight_map.sum() > 0:
+            object_region = (abs_error * object_weight_map).sum() / object_weight_map.sum().clamp_min(1.0)
+
+        # ================= 5. 过曝抑制（保持不变）=================
+        excess = F.relu(fused - max_intensity - self.excess_margin)
+        if object_weight_map.sum() > 0:
+            excess_weight_map = torch.clamp(object_weight_map + 0.25, max=1.0)
+            excess_artifact = weighted_mean(excess, excess_weight_map)
+        else:
+            excess_artifact = excess.mean()
+
+        # ================= 6. 平坦平滑损失（保持不变）=================
+        flat_mask = (torch.maximum(ir_grad, vis_grad) < self.flat_gradient_threshold).to(dtype=fused.dtype)
+        flat_smoothness = weighted_mean(gradient_map(fused), flat_mask)
+
+        # ================= 7. SAM 相关（保持纹理优先）=================
         sam_consistency = fused.new_tensor(0.0)
+        ring_artifact = fused.new_tensor(0.0)
         if sam_mask is not None:
             sam = sam_mask.float().clamp(0.0, 1.0)
-            sam_consistency = F.l1_loss(fused * sam, target_intensity * sam)
+            # SAM 掩膜区域的纹理，同样和“纹理优势参考图”对比
+            sam_consistency = F.l1_loss(fused * sam, target_struct_img * sam)
+            
+            ring_mask = self._build_sam_ring(sam, self.ring_width)
+            if ring_mask.sum() > 0:
+                ring_excess = F.relu(fused - ir - self.excess_margin)
+                ring_artifact = weighted_mean(ring_excess, ring_mask)
+                ring_artifact = ring_artifact + 0.25 * weighted_mean(
+                    gradient_map(fused),
+                    ring_mask,
+                )
+
+        # ================= 8. 总 Loss 求和 =================
         loss = (
             self.intensity_weight * intensity
             + self.gradient_weight * gradient
-            + sam_consistency
+            + self.object_region_weight * object_region
+            + self.sam_weight * sam_consistency
+            + self.ssim_weight * structure
+            + self.perceptual_weight * perceptual
+            + self.excess_weight * excess_artifact
+            + self.flat_smoothness_weight * flat_smoothness
+            + self.ring_artifact_weight * ring_artifact
         )
         return {
             "fusion_loss": loss,
-            "intensity_loss": intensity,
             "gradient_loss": gradient,
+            "object_region_loss": object_region,
             "sam_consistency_loss": sam_consistency,
+            "ssim_loss": structure,
+            "perceptual_loss": perceptual,
+            "excess_artifact_loss": excess_artifact,
+            "flat_smoothness_loss": flat_smoothness,
+            "ring_artifact_loss": ring_artifact,
+            "object_region_pixels": object_weight_map.sum(),
         }
+
+    @staticmethod
+    def _build_weight_map(
+        targets: list[dict[str, torch.Tensor]],
+        shape: torch.Size,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        batch_size, _, height, width = shape
+        mask = torch.zeros((batch_size, 1, height, width), device=device, dtype=dtype)
+        for batch_idx, target in enumerate(targets):
+            if batch_idx >= batch_size:
+                break
+            boxes = target["boxes"].to(device=device, dtype=torch.float32)
+            if boxes.numel() == 0:
+                continue
+            if target.get("box_format", "cxcywh") == "cxcywh":
+                boxes = cxcywh_to_xyxy(boxes)
+            boxes = boxes.clamp(0.0, 1.0)
+            for box in boxes:
+                x1, y1, x2, y2 = box.tolist()
+                left = max(0, min(width - 1, int(torch.floor(box.new_tensor(x1 * width)).item())))
+                top = max(0, min(height - 1, int(torch.floor(box.new_tensor(y1 * height)).item())))
+                right = max(left + 1, min(width, int(torch.ceil(box.new_tensor(x2 * width)).item())))
+                bottom = max(top + 1, min(height, int(torch.ceil(box.new_tensor(y2 * height)).item())))
+                mask[batch_idx, :, top:bottom, left:right] = 1.0
+        return mask
+
+    @staticmethod
+    def _build_sam_ring(sam_mask: torch.Tensor, ring_width: int) -> torch.Tensor:
+        if ring_width <= 0:
+            return torch.zeros_like(sam_mask)
+        binary = (sam_mask > 0.5).to(dtype=sam_mask.dtype)
+        if binary.sum() == 0:
+            return torch.zeros_like(binary)
+        kernel_size = ring_width * 2 + 1
+        dilated = F.max_pool2d(
+            binary,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=ring_width,
+        )
+        return (dilated - binary).clamp(0.0, 1.0)
+
+
+FusionReconstructionLoss = DetectionAwareFusionLoss
 
 
 class YOLOLikeDetectionLoss(nn.Module):
@@ -153,12 +342,20 @@ class JointFusionDetectionLoss(nn.Module):
         fusion_weight: float = 1.0,
         detection_weight: float = 1.0,
         use_feedback: bool = True,
+        # target_max_weight: float = 0.8,
+        excess_weight: float = 0.35,
+        flat_smoothness_weight: float = 0.0,
+        ring_artifact_weight: float = 0.25,
     ) -> None:
         super().__init__()
         self.fusion_weight = fusion_weight
         self.detection_weight = detection_weight
         self.use_feedback = use_feedback
-        self.fusion_loss = FusionReconstructionLoss()
+        self.fusion_loss = DetectionAwareFusionLoss(
+            excess_weight=excess_weight,
+            flat_smoothness_weight=flat_smoothness_weight,
+            ring_artifact_weight=ring_artifact_weight,
+        )
         self.detection_loss = YOLOLikeDetectionLoss(num_classes=num_classes)
         self.feedback_weight = DetectionFeedbackLossWeight(base_lambda=detection_weight)
 
@@ -171,7 +368,7 @@ class JointFusionDetectionLoss(nn.Module):
         targets: list[dict[str, torch.Tensor]],
         use_feedback: bool | None = None,
     ) -> dict[str, torch.Tensor]:
-        fusion_terms = self.fusion_loss(outputs["I_fused"], ir, vis, sam_mask)
+        fusion_terms = self.fusion_loss(outputs["I_fused"], ir, vis, targets, sam_mask)
         decoded = outputs["detections"]["decoded"]
         if outputs["detections"].get("trainable", True):
             detection_terms = self.detection_loss(

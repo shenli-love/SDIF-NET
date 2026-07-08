@@ -9,12 +9,12 @@ from .decoder import FusionDecoder
 from .detector import UltralyticsYOLODetector, YOLOLikeHead
 from .encoder import CNNEncoder
 from .fpn import FeaturePyramid
-from .fusion import SDIFUnifiedFusion
+from .fusion import SAMQKVUnifiedFusion
 from .sam import SAMPriorEncoder
 
 
 class IRVISFusionDetectionNet(nn.Module):
-    """End-to-end SDIF-Net: encoder -> FPN -> SDIF fusion -> decoder -> detector."""
+    """End-to-end fusion network: encoder -> FPN -> SQUA fusion -> decoder -> detector."""
 
     def __init__(
         self,
@@ -28,21 +28,22 @@ class IRVISFusionDetectionNet(nn.Module):
         use_feedback: bool = True,
         detector_backend: str = "yolo_like",
         yolo_weights: str | None = None,
-        yolo_imgsz: int = 640,
-        yolo_conf: float = 0.25,
-        yolo_iou: float = 0.7,
-        yolo_max_det: int = 300,
+        yolo_imgsz: int = 1024,
+        yolo_conf: float = 0.15,
+        yolo_iou: float = 0.5,
+        yolo_max_det: int = 500,
         yolo_classes: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.use_sam = use_sam
         self.use_feedback = use_feedback
+        self.detector_backend = detector_backend
         self.ir_encoder = CNNEncoder(ir_channels, encoder_channels)
         self.vis_encoder = CNNEncoder(vis_channels, encoder_channels)
         self.ir_fpn = FeaturePyramid(encoder_channels, fpn_channels)
         self.vis_fpn = FeaturePyramid(encoder_channels, fpn_channels)
         self.sam_encoder = SAMPriorEncoder()
-        self.fusion = SDIFUnifiedFusion(fpn_channels)
+        self.fusion = SAMQKVUnifiedFusion(fpn_channels)
         self.decoder = FusionDecoder(fpn_channels, fused_channels)
         if detector_backend == "ultralytics":
             default_weights = Path(__file__).with_name("yolo11n.pt")
@@ -97,7 +98,8 @@ class IRVISFusionDetectionNet(nn.Module):
         }
         if return_logs:
             output["forward_logs"] = {
-                "pipeline": "encoder->fpn->sdif_fusion->decoder->detector",
+                "pipeline": "encoder->fpn->squa_fusion->decoder->detector",
+                "detector_backend": self.detector_backend,
                 "sam_prior": sam_attention is not None,
                 "mode": "single_pass",
                 "feedback_path": "loss_only",
