@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="root@v0ftpqpntcldc4e7snow.deepln.com:45085 password" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@lzj6fcxanbhtroyosnow.deepln.com:47389 password" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
       <paths name="root@3bdixqmlngnv8fcusnow.deepln.com:40362 password">
         <serverdata>
@@ -59,6 +59,13 @@
         </serverdata>
       </paths>
       <paths name="root@lyahdgfmykw90nirsnow.deepln.com:47862 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data/coding" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@lzj6fcxanbhtroyosnow.deepln.com:47389 password">
         <serverdata>
           <mappings>
             <mapping deploy="/data/coding" local="$PROJECT_DIR$" />

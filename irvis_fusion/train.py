@@ -24,15 +24,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-steps-per-epoch", type=int, default=0)
-    parser.add_argument("--detector-backend", default="yolo_like", choices=["yolo_like", "ultralytics"])
-    parser.add_argument("--yolo-weights", default=None)
-    parser.add_argument("--yolo-imgsz", type=int, default=1024)
     parser.add_argument("--fusion-weight", type=float, default=1.0)
     parser.add_argument("--detection-weight", type=float, default=1.0)
     # parser.add_argument("--target-max-weight", type=float, default=0.8)
     parser.add_argument("--excess-weight", type=float, default=0.35)
-    parser.add_argument("--flat-smoothness-weight", type=float, default=0.0)
+    parser.add_argument("--flat-smoothness-weight", type=float, default=0.02)
     parser.add_argument("--ring-artifact-weight", type=float, default=0.25)
+    parser.add_argument("--thermal-preserve-weight", type=float, default=1.2)
+    parser.add_argument("--halo-artifact-weight", type=float, default=0.25)
+    parser.add_argument("--texture-blur-kernel", type=int, default=5)
+    parser.add_argument("--contrast-blur-kernel", type=int, default=9)
+    parser.add_argument("--thermal-margin", type=float, default=0.03)
+    parser.add_argument("--thermal-temperature", type=float, default=18.0)
+    parser.add_argument("--gradient-overshoot-margin", type=float, default=0.01)
     parser.add_argument("--no-sam", action="store_true")
     parser.add_argument("--no-feedback", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -104,9 +108,6 @@ def main() -> None:
         num_classes=args.num_classes,
         use_sam=not args.no_sam,
         use_feedback=not args.no_feedback,
-        detector_backend=args.detector_backend,
-        yolo_weights=args.yolo_weights,
-        yolo_imgsz=args.yolo_imgsz,
     ).to(device)
     criterion = JointFusionDetectionLoss(
         num_classes=args.num_classes,
@@ -117,6 +118,13 @@ def main() -> None:
         excess_weight=args.excess_weight,
         flat_smoothness_weight=args.flat_smoothness_weight,
         ring_artifact_weight=args.ring_artifact_weight,
+        thermal_preserve_weight=args.thermal_preserve_weight,
+        halo_artifact_weight=args.halo_artifact_weight,
+        texture_blur_kernel=args.texture_blur_kernel,
+        contrast_blur_kernel=args.contrast_blur_kernel,
+        thermal_margin=args.thermal_margin,
+        thermal_temperature=args.thermal_temperature,
+        gradient_overshoot_margin=args.gradient_overshoot_margin,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     start_epoch, global_step = load_training_checkpoint(
@@ -171,7 +179,7 @@ def main() -> None:
             if step == 1 or step % 20 == 0:
                 print(
                     "epoch=[{}/{}] step=[{}/{}] loss={:.4f} fusion={:.4f} "
-                    "det={:.4f} excess={:.4f} smooth={:.4f} ring={:.4f} "
+                    "det={:.4f} excess={:.4f} smooth={:.4f} ring={:.4f} thermal={:.4f} halo={:.4f} "
                     "lambda_det={:.3f} recall={:.3f} conf={:.3f}".format(
                         epoch,
                         args.epochs,
@@ -183,6 +191,8 @@ def main() -> None:
                         float(losses["excess_artifact_loss"].item()),
                         float(losses["flat_smoothness_loss"].item()),
                         float(losses["ring_artifact_loss"].item()),
+                        float(losses["thermal_preserve_loss"].item()),
+                        float(losses["halo_artifact_loss"].item()),
                         float(losses["lambda_det"].item()),
                         float(losses["detection_recall"].item()),
                         float(losses["detection_confidence"].item()),

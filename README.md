@@ -11,9 +11,8 @@ fusion and detection-guided optimization.
 - small-target-aware three-scale SQUA fusion over FPN features
 - FPN-style decoder that reconstructs `I_fused`
 - compact YOLO-like dense detection head for differentiable joint training
-- optional Ultralytics YOLO11 detector with local `yolo11n.pt` weights
 - detection feedback as a dynamic detection-loss weight
-- ablation switches: `use_sam`, `use_feedback`, `detector_backend`
+- ablation switches: `use_sam`, `use_feedback`
 
 ## Data Layout
 
@@ -57,7 +56,6 @@ Disable modules for ablation:
 ```bash
 python -m irvis_fusion.train --no-sam
 python -m irvis_fusion.train --no-feedback
-python -m irvis_fusion.train --detector-backend ultralytics
 ```
 
 ## Inference
@@ -68,15 +66,6 @@ python -m irvis_fusion.infer ^
   --split val ^
   --checkpoint runs/irvis_sdif_feedback/epoch_020.pt ^
   --output-dir runs/infer
-```
-
-To run official YOLO11 inference, provide the weight path:
-
-```bash
-python -m irvis_fusion.infer ^
-  --checkpoint runs/irvis_sdif_feedback/epoch_020.pt ^
-  --detector-backend ultralytics ^
-  --yolo-weights irvis_fusion/models/yolo11n.pt
 ```
 
 Inference saves:
@@ -95,19 +84,16 @@ Inference saves:
 - `sam_attention`: soft SAM prior `A_sam`
 - `forward_logs`: confirms the single-pass SQUA pipeline
 
-## Detector Backends
+## Detector
 
-The default `yolo_like` backend is trainable and keeps the fusion/detection
-objective fully differentiable. The optional `ultralytics` backend uses
-`irvis_fusion/models/yolo11n.pt` with `imgsz=1024`, matching the 1024x768
-Tardal-style inputs better for distant pedestrians during inference/evaluation.
-Ultralytics NMS is not used as a differentiable detection loss.
+The built-in YOLO-like detector is trainable and keeps the fusion/detection
+objective fully differentiable.
 
 SQUA avoids full-image softmax suppression by mixing local-window contrast
 attention with global context. It also learns a region-adaptive IR/VIS modality
 gate, giving IR stronger influence in locally salient thermal regions.
 
-Both backends keep this return contract:
+The detector keeps this return contract:
 
 ```python
 {

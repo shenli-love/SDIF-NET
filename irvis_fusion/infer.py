@@ -28,12 +28,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--num-classes", type=int, default=6)
-    parser.add_argument("--detector-backend", default="yolo_like", choices=["yolo_like", "ultralytics"])
-    parser.add_argument("--yolo-weights", default=None)
-    parser.add_argument("--yolo-imgsz", type=int, default=1024)
-    parser.add_argument("--yolo-conf", type=float, default=0.15)
-    parser.add_argument("--yolo-iou", type=float, default=0.5)
-    parser.add_argument("--yolo-max-det", type=int, default=500)
     parser.add_argument("--save-conf", type=float, default=0.15)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--no-sam", action="store_true")
@@ -151,12 +145,6 @@ def main() -> None:
     model = IRVISFusionDetectionNet(
         num_classes=args.num_classes,
         use_sam=not args.no_sam,
-        detector_backend=args.detector_backend,
-        yolo_weights=args.yolo_weights,
-        yolo_imgsz=args.yolo_imgsz,
-        yolo_conf=args.yolo_conf,
-        yolo_iou=args.yolo_iou,
-        yolo_max_det=args.yolo_max_det,
     ).to(device)
     load_checkpoint(model, args.checkpoint, device)
     model.eval()

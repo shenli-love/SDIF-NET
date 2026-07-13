@@ -17,8 +17,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-classes", type=int, default=6)
     parser.add_argument("--no-sam", action="store_true")
     parser.add_argument("--no-feedback", action="store_true")
-    parser.add_argument("--detector-backend", default="yolo_like", choices=["yolo_like", "ultralytics"])
-    parser.add_argument("--yolo-imgsz", type=int, default=640)
     return parser.parse_args()
 
 
@@ -50,8 +48,6 @@ def main() -> None:
         num_classes=args.num_classes,
         use_sam=not args.no_sam,
         use_feedback=not args.no_feedback,
-        detector_backend=args.detector_backend,
-        yolo_imgsz=args.yolo_imgsz,
     ).to(device)
     criterion = JointFusionDetectionLoss(
         num_classes=args.num_classes,

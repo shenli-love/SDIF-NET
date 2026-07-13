@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
 from torch import nn
 
 from .decoder import FusionDecoder
-from .detector import UltralyticsYOLODetector, YOLOLikeHead
+from .detector import YOLOLikeHead
 from .encoder import CNNEncoder
 from .fpn import FeaturePyramid
 from .fusion import SAMQKVUnifiedFusion
@@ -26,18 +24,10 @@ class IRVISFusionDetectionNet(nn.Module):
         num_classes: int = 6,
         use_sam: bool = True,
         use_feedback: bool = True,
-        detector_backend: str = "yolo_like",
-        yolo_weights: str | None = None,
-        yolo_imgsz: int = 1024,
-        yolo_conf: float = 0.15,
-        yolo_iou: float = 0.5,
-        yolo_max_det: int = 500,
-        yolo_classes: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.use_sam = use_sam
         self.use_feedback = use_feedback
-        self.detector_backend = detector_backend
         self.ir_encoder = CNNEncoder(ir_channels, encoder_channels)
         self.vis_encoder = CNNEncoder(vis_channels, encoder_channels)
         self.ir_fpn = FeaturePyramid(encoder_channels, fpn_channels)
@@ -45,21 +35,11 @@ class IRVISFusionDetectionNet(nn.Module):
         self.sam_encoder = SAMPriorEncoder()
         self.fusion = SAMQKVUnifiedFusion(fpn_channels)
         self.decoder = FusionDecoder(fpn_channels, fused_channels)
-        if detector_backend == "ultralytics":
-            default_weights = Path(__file__).with_name("yolo11n.pt")
-            self.detector = UltralyticsYOLODetector(
-                yolo_weights or default_weights,
-                num_classes=num_classes,
-                imgsz=yolo_imgsz,
-                conf_threshold=yolo_conf,
-                iou_threshold=yolo_iou,
-                max_det=yolo_max_det,
-                classes=yolo_classes,
-            )
-        elif detector_backend == "yolo_like":
-            self.detector = YOLOLikeHead(fused_channels, num_classes=num_classes)
-        else:
-            raise ValueError(f"Unsupported detector backend: {detector_backend}")
+        self.detector = YOLOLikeHead(
+            fused_channels=fpn_channels,
+            use_fused_features=True,
+            num_classes=num_classes,
+        )
 
     def forward(
         self,
@@ -86,8 +66,12 @@ class IRVISFusionDetectionNet(nn.Module):
             vis_features,
             sam_attention=sam_attention,
         )
+        
+        # Decoder generates fused image for visualization and fusion loss
         fused_image = self.decoder(fused_features, output_size=ir.shape[-2:])
-        detection_outputs = self.detector(fused_image)
+        
+        # Detector directly consumes multi-scale fused features.
+        detection_outputs = self.detector(image=None, fused_features=fused_features)
 
         output = {
             "I_fused": fused_image,
@@ -99,7 +83,7 @@ class IRVISFusionDetectionNet(nn.Module):
         if return_logs:
             output["forward_logs"] = {
                 "pipeline": "encoder->fpn->squa_fusion->decoder->detector",
-                "detector_backend": self.detector_backend,
+                "detector": "yolo_like",
                 "sam_prior": sam_attention is not None,
                 "mode": "single_pass",
                 "feedback_path": "loss_only",

@@ -1,3 +1,7 @@
 datasets/
 *.pt
 *.png
+runs/
+checkpoints/
+epoch_005.pt
+epoch_008.pt
