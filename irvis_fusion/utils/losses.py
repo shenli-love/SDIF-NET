@@ -16,61 +16,8 @@ def gradient_map(x: torch.Tensor) -> torch.Tensor:
     return dx + dy
 
 
-def laplacian_map(x: torch.Tensor) -> torch.Tensor:
-    kernel = x.new_tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]])
-    kernel = kernel.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
-    return torch.abs(F.conv2d(x, kernel, padding=1, groups=x.shape[1]))
-
-
-def box_blur(x: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
-    if kernel_size <= 1:
-        return x
-    pad = kernel_size // 2
-    return F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=pad)
-
-
-def local_contrast_map(x: torch.Tensor, kernel_size: int = 9) -> torch.Tensor:
-    return torch.abs(x - box_blur(x, kernel_size))
-
-
-def ssim_loss(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
-    pad = window_size // 2
-    c1 = 0.01**2
-    c2 = 0.03**2
-    mu_x = F.avg_pool2d(x, window_size, stride=1, padding=pad)
-    mu_y = F.avg_pool2d(y, window_size, stride=1, padding=pad)
-    mu_x_sq = mu_x.pow(2)
-    mu_y_sq = mu_y.pow(2)
-    mu_xy = mu_x * mu_y
-    sigma_x = F.avg_pool2d(x * x, window_size, stride=1, padding=pad) - mu_x_sq
-    sigma_y = F.avg_pool2d(y * y, window_size, stride=1, padding=pad) - mu_y_sq
-    sigma_xy = F.avg_pool2d(x * y, window_size, stride=1, padding=pad) - mu_xy
-    numerator = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
-    denominator = (mu_x_sq + mu_y_sq + c1) * (sigma_x + sigma_y + c2)
-    ssim = numerator / denominator.clamp_min(1e-6)
-    return 1.0 - ssim.clamp(0.0, 1.0).mean()
-
-
-def multiscale_structure_loss(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    scales: tuple[int, ...] = (1, 2, 4),
-) -> torch.Tensor:
-    loss = x.new_tensor(0.0)
-    valid_scales = 0
-    for scale in scales:
-        if scale > 1:
-            if min(x.shape[-2:]) < scale:
-                continue
-            cur_x = F.avg_pool2d(x, kernel_size=scale, stride=scale)
-            cur_y = F.avg_pool2d(y, kernel_size=scale, stride=scale)
-        else:
-            cur_x = x
-            cur_y = y
-        loss = loss + F.l1_loss(gradient_map(cur_x), gradient_map(cur_y))
-        loss = loss + 0.5 * F.l1_loss(laplacian_map(cur_x), laplacian_map(cur_y))
-        valid_scales += 1
-    return loss / max(valid_scales, 1)
+def charbonnier(value: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    return torch.sqrt(value.pow(2) + eps * eps)
 
 
 def weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -78,52 +25,39 @@ def weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 class DetectionAwareFusionLoss(nn.Module):
-    """Fusion loss with GT-box spatial weighting for detection-aware training."""
+    """Task-aware fusion objective for IR/VIS detection.
+
+    Object boxes are supervised toward IR because thermal contrast is usually
+    the detection cue. Background is supervised toward VIS so scene structure
+    remains stable without letting bright VIS regions overwrite target texture.
+    """
 
     def __init__(
         self,
-        intensity_weight: float = 0.1,
+        ssim_window: int = 7,
+        object_weight: float = 2.0,
+        background_weight: float = 1.0,
         gradient_weight: float = 1.0,
-        object_region_weight: float = 0.5,
-        sam_weight: float = 1.0,
         ssim_weight: float = 0.5,
-        perceptual_weight: float = 0.2,
-        # target_max_weight: float = 1,
-        excess_weight: float = 0.35,
-        flat_smoothness_weight: float = 0.02,
-        ring_artifact_weight: float = 0.25,
-        thermal_preserve_weight: float = 1.2,
-        halo_artifact_weight: float = 0.25,
-        texture_blur_kernel: int = 5,
-        contrast_blur_kernel: int = 9,
-        thermal_margin: float = 0.03,
-        thermal_temperature: float = 18.0,
-        excess_margin: float = 0.03,
-        gradient_overshoot_margin: float = 0.01,
-        flat_gradient_threshold: float = 0.01,
-        ring_width: int = 15,
+        detection_guided_weight: float = 0.5,
+        modal_specific_weight: float = 0.5,
+        missed_object_weight: float = 2.0,
+        detected_object_weight: float = 0.5,
+        detection_conf_threshold: float = 0.25,
+        detection_iou_threshold: float = 0.5,
     ) -> None:
         super().__init__()
-        self.intensity_weight = intensity_weight
+        self.ssim_window = ssim_window
+        self.object_weight = object_weight
+        self.background_weight = background_weight
         self.gradient_weight = gradient_weight
-        self.object_region_weight = object_region_weight
-        self.sam_weight = sam_weight
         self.ssim_weight = ssim_weight
-        self.perceptual_weight = perceptual_weight
-        # self.target_max_weight = target_max_weight
-        self.excess_weight = excess_weight
-        self.flat_smoothness_weight = flat_smoothness_weight
-        self.ring_artifact_weight = ring_artifact_weight
-        self.thermal_preserve_weight = thermal_preserve_weight
-        self.halo_artifact_weight = halo_artifact_weight
-        self.texture_blur_kernel = texture_blur_kernel
-        self.contrast_blur_kernel = contrast_blur_kernel
-        self.thermal_margin = thermal_margin
-        self.thermal_temperature = thermal_temperature
-        self.excess_margin = excess_margin
-        self.gradient_overshoot_margin = gradient_overshoot_margin
-        self.flat_gradient_threshold = flat_gradient_threshold
-        self.ring_width = ring_width
+        self.detection_guided_weight = detection_guided_weight
+        self.modal_specific_weight = modal_specific_weight
+        self.missed_object_weight = missed_object_weight
+        self.detected_object_weight = detected_object_weight
+        self.detection_conf_threshold = detection_conf_threshold
+        self.detection_iou_threshold = detection_iou_threshold
 
     def forward(
         self,
@@ -131,138 +65,148 @@ class DetectionAwareFusionLoss(nn.Module):
         ir: torch.Tensor,
         vis: torch.Tensor,
         targets: list[dict[str, torch.Tensor]],
-        sam_mask: torch.Tensor | None = None,
+        detections: dict[str, object] | None = None,
     ) -> dict[str, torch.Tensor]:
-        # ================= 1. 计算纹理能量 =================
-        # 先计算梯度图代表纹理能量
+        object_map = self._build_weight_map(targets, fused.shape, fused.device, fused.dtype)
+        background_map = 1.0 - object_map
+
         ir_grad = gradient_map(ir)
         vis_grad = gradient_map(vis)
-        object_weight_map = self._build_weight_map(targets, fused.shape, fused.device, fused.dtype)
-        if sam_mask is not None:
-            sam = sam_mask.float().clamp(0.0, 1.0)
-        else:
-            sam = None
-
-        # Use a hard source target again, but make the decision from smoothed
-        # structure energy rather than raw per-pixel gradients. This keeps the
-        # old crispness without the salt-and-pepper supervision.
-        ir_structure = box_blur(
-            ir_grad + 0.5 * local_contrast_map(ir, self.contrast_blur_kernel),
-            self.texture_blur_kernel,
-        )
-        vis_structure = box_blur(
-            vis_grad + 0.5 * local_contrast_map(vis, self.contrast_blur_kernel),
-            self.texture_blur_kernel,
-        )
-        texture_mask = (ir_structure >= vis_structure).to(dtype=fused.dtype)
-
-        thermal_score = torch.sigmoid(
-            (ir - vis - self.thermal_margin) * self.thermal_temperature
-        )
-        focus_mask = object_weight_map
-        if sam is not None:
-            focus_mask = torch.maximum(focus_mask, sam.to(dtype=fused.dtype))
-        focused_thermal_mask = torch.sigmoid((ir - vis) * self.thermal_temperature)
-        thermal_score = torch.maximum(thermal_score, focus_mask * focused_thermal_mask)
-        thermal_mask = (thermal_score > 0.5).to(dtype=fused.dtype)
-
-        # ================= 2. 构建“纹理优势参考图” =================
-        texture_target = torch.where(texture_mask > 0.5, ir, vis)
-        target_struct_img = torch.where(thermal_mask > 0.5, ir, texture_target)
-
-        # 保留 max_intensity 仅用于抑制过曝，不做训练目标！
-        max_intensity = torch.maximum(ir, vis)
-
-        # ================= 3. 结构损失和感知损失 =================
-        # 直接对比融合图与“纹理优势参考图”，彻底代替之前死板的 ir
-        target_grad = gradient_map(target_struct_img)
-        max_grad = torch.maximum(ir_grad, vis_grad)
-        grad_weight = (box_blur(target_grad, self.texture_blur_kernel) > self.flat_gradient_threshold).to(
-            dtype=fused.dtype
-        )
-        grad_weight = torch.maximum(grad_weight, object_weight_map)
-        if sam is not None:
-            grad_weight = torch.maximum(grad_weight, sam.to(dtype=fused.dtype))
         fused_grad = gradient_map(fused)
-        gradient = weighted_mean((fused_grad - target_grad).abs(), grad_weight)
-        structure = ssim_loss(fused, target_struct_img)
-        perceptual = multiscale_structure_loss(fused, target_struct_img)
 
-        intensity = F.l1_loss(fused, target_struct_img)
-        thermal_preserve = weighted_mean(F.relu(ir - fused), thermal_score)
-
-        # ================= 4. 目标区域加权损失 =================
-        abs_error = (fused - target_struct_img).abs()  # 目标区域比对纹理优势图
-        object_region = fused.new_tensor(0.0)
-        if object_weight_map.sum() > 0:
-            object_region = (abs_error * object_weight_map).sum() / object_weight_map.sum().clamp_min(1.0)
-
-        # ================= 5. 过曝抑制（保持不变）=================
-        excess = F.relu(fused - max_intensity - self.excess_margin)
-        if object_weight_map.sum() > 0:
-            excess_weight_map = torch.clamp(object_weight_map + 0.25, max=1.0)
-            excess_artifact = weighted_mean(excess, excess_weight_map)
-        else:
-            excess_artifact = excess.mean()
-
-        edge_mask = (
-            box_blur(torch.maximum(target_grad, max_grad), self.texture_blur_kernel)
-            > self.flat_gradient_threshold
-        ).to(dtype=fused.dtype)
-        halo_artifact = weighted_mean(
-            F.relu(fused - max_intensity - self.excess_margin)
-            + 0.25 * F.relu(fused_grad - target_grad - self.gradient_overshoot_margin),
-            edge_mask,
+        object_intensity_loss = weighted_mean(charbonnier(fused - ir), object_map)
+        background_intensity_loss = weighted_mean(charbonnier(fused - vis), background_map)
+        object_gradient_loss = weighted_mean(charbonnier(fused_grad - ir_grad), object_map)
+        background_gradient_loss = weighted_mean(
+            charbonnier(fused_grad - vis_grad),
+            background_map,
         )
 
-        # ================= 6. 平坦平滑损失（保持不变）=================
-        flat_mask = (torch.maximum(ir_grad, vis_grad) < self.flat_gradient_threshold).to(dtype=fused.dtype)
-        flat_smoothness = weighted_mean(gradient_map(fused), flat_mask)
+        object_ssim_loss = weighted_mean(self._ssim_loss_map(fused, ir), object_map)
+        background_ssim_loss = weighted_mean(self._ssim_loss_map(fused, vis), background_map)
 
-        # ================= 7. SAM 相关（保持纹理优先）=================
-        sam_consistency = fused.new_tensor(0.0)
-        ring_artifact = fused.new_tensor(0.0)
-        if sam is not None:
-            # SAM 掩膜区域的纹理，同样和“纹理优势参考图”对比
-            sam_consistency = F.l1_loss(fused * sam, target_struct_img * sam)
-            
-            ring_mask = self._build_sam_ring(sam, self.ring_width)
-            if ring_mask.sum() > 0:
-                ring_excess = F.relu(fused - ir - self.excess_margin)
-                ring_artifact = weighted_mean(ring_excess, ring_mask)
-                ring_artifact = ring_artifact + 0.25 * weighted_mean(
-                    gradient_map(fused),
-                    ring_mask,
-                )
-
-        # ================= 8. 总 Loss 求和 =================
-        loss = (
-            self.intensity_weight * intensity
-            + self.gradient_weight * gradient
-            + self.object_region_weight * object_region
-            + self.sam_weight * sam_consistency
-            + self.ssim_weight * structure
-            + self.perceptual_weight * perceptual
-            + self.excess_weight * excess_artifact
-            + self.flat_smoothness_weight * flat_smoothness
-            + self.ring_artifact_weight * ring_artifact
-            + self.thermal_preserve_weight * thermal_preserve
-            + self.halo_artifact_weight * halo_artifact
+        detection_attention = self._build_detection_attention_map(
+            targets=targets,
+            shape=fused.shape,
+            device=fused.device,
+            dtype=fused.dtype,
+            detections=detections,
         )
+        detection_guided_loss = self.detection_guided_weight * weighted_mean(
+            charbonnier(fused - ir) + charbonnier(fused_grad - ir_grad),
+            detection_attention,
+        )
+        modal_specific_loss = self.modal_specific_weight * self._modal_specific_loss(
+            fused_grad=fused_grad,
+            ir_grad=ir_grad,
+            vis_grad=vis_grad,
+        )
+
+        object_loss = (
+            object_intensity_loss
+            + self.gradient_weight * object_gradient_loss
+            + self.ssim_weight * object_ssim_loss
+            + detection_guided_loss
+        )
+        background_loss = (
+            background_intensity_loss
+            + self.gradient_weight * background_gradient_loss
+            + self.ssim_weight * background_ssim_loss
+        )
+        fusion_loss = (
+            self.object_weight * object_loss
+            + self.background_weight * background_loss
+            + modal_specific_loss
+        )
+        zero = fused.new_tensor(0.0)
         return {
-            "fusion_loss": loss,
-            "gradient_loss": gradient,
-            "object_region_loss": object_region,
-            "sam_consistency_loss": sam_consistency,
-            "ssim_loss": structure,
-            "perceptual_loss": perceptual,
-            "excess_artifact_loss": excess_artifact,
-            "flat_smoothness_loss": flat_smoothness,
-            "ring_artifact_loss": ring_artifact,
-            "thermal_preserve_loss": thermal_preserve,
-            "halo_artifact_loss": halo_artifact,
-            "object_region_pixels": object_weight_map.sum(),
+            "fusion_loss": fusion_loss,
+            "object_intensity_loss": object_intensity_loss,
+            "background_intensity_loss": background_intensity_loss,
+            "object_gradient_loss": object_gradient_loss,
+            "background_gradient_loss": background_gradient_loss,
+            "object_ssim_loss": object_ssim_loss,
+            "background_ssim_loss": background_ssim_loss,
+            "object_loss": object_loss,
+            "background_loss": background_loss,
+            "detection_guided_loss": detection_guided_loss,
+            "modal_specific_loss": modal_specific_loss,
+            "detection_attention_mean": detection_attention.mean(),
+            # Backward-compatible summaries for existing training logs.
+            "intensity_loss": object_intensity_loss + background_intensity_loss,
+            "gradient_loss": object_gradient_loss + background_gradient_loss,
+            "ssim_loss": object_ssim_loss + background_ssim_loss,
+            "nan_guard": zero,
         }
+
+    def _modal_specific_loss(
+        self,
+        fused_grad: torch.Tensor,
+        ir_grad: torch.Tensor,
+        vis_grad: torch.Tensor,
+    ) -> torch.Tensor:
+        ir_unique = torch.sigmoid(8.0 * (ir_grad.detach() - vis_grad.detach()))
+        vis_unique = torch.sigmoid(8.0 * (vis_grad.detach() - ir_grad.detach()))
+        ir_term = weighted_mean(charbonnier(fused_grad - ir_grad), ir_unique)
+        vis_term = weighted_mean(charbonnier(fused_grad - vis_grad), vis_unique)
+        max_grad = torch.maximum(ir_grad, vis_grad)
+        max_term = charbonnier(F.relu(max_grad.detach() - fused_grad)).mean()
+        return ir_term + vis_term + max_term
+
+    def _ssim_loss(self, fused: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return self._ssim_loss_map(fused, target).mean()
+
+    def _ssim_loss_map(self, fused: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        window = self.ssim_window
+        padding = window // 2
+        mu_fused = F.avg_pool2d(
+            fused,
+            kernel_size=window,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        )
+        mu_ref = F.avg_pool2d(
+            target,
+            kernel_size=window,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        )
+        sigma_fused = F.avg_pool2d(
+            fused * fused,
+            kernel_size=window,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        ) - mu_fused.pow(2)
+        sigma_ref = F.avg_pool2d(
+            target * target,
+            kernel_size=window,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        ) - mu_ref.pow(2)
+        sigma_cross = F.avg_pool2d(
+            fused * target,
+            kernel_size=window,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        ) - mu_fused * mu_ref
+        sigma_fused = sigma_fused.clamp_min(0.0)
+        sigma_ref = sigma_ref.clamp_min(0.0)
+
+        c1 = 0.01 ** 2
+        c2 = 0.03 ** 2
+        ssim = (
+            (2.0 * mu_fused * mu_ref + c1)
+            * (2.0 * sigma_cross + c2)
+        ) / (
+            (mu_fused.pow(2) + mu_ref.pow(2) + c1)
+            * (sigma_fused + sigma_ref + c2)
+        ).clamp_min(1e-6)
+        return torch.nan_to_num(1.0 - ssim.clamp(0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0)
 
     @staticmethod
     def _build_weight_map(
@@ -291,22 +235,87 @@ class DetectionAwareFusionLoss(nn.Module):
                 mask[batch_idx, :, top:bottom, left:right] = 1.0
         return mask
 
-    @staticmethod
-    def _build_sam_ring(sam_mask: torch.Tensor, ring_width: int) -> torch.Tensor:
-        if ring_width <= 0:
-            return torch.zeros_like(sam_mask)
-        binary = (sam_mask > 0.5).to(dtype=sam_mask.dtype)
-        if binary.sum() == 0:
-            return torch.zeros_like(binary)
-        kernel_size = ring_width * 2 + 1
-        dilated = F.max_pool2d(
-            binary,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=ring_width,
-        )
-        return (dilated - binary).clamp(0.0, 1.0)
+    def _build_detection_attention_map(
+        self,
+        targets: list[dict[str, torch.Tensor]],
+        shape: torch.Size,
+        device: torch.device,
+        dtype: torch.dtype,
+        detections: dict[str, object] | None,
+    ) -> torch.Tensor:
+        batch_size, _, height, width = shape
+        attention = torch.zeros((batch_size, 1, height, width), device=device, dtype=dtype)
+        if detections is None:
+            return attention
 
+        decoded = detections.get("decoded", detections)
+        if not isinstance(decoded, dict):
+            return attention
+        if "boxes" not in decoded or "scores" not in decoded:
+            return attention
+
+        pred_boxes = decoded["boxes"]
+        pred_scores = decoded["scores"]
+        if not torch.is_tensor(pred_boxes) or not torch.is_tensor(pred_scores):
+            return attention
+
+        pred_boxes = pred_boxes.detach().to(device=device, dtype=torch.float32)
+        pred_scores = pred_scores.detach().to(device=device, dtype=torch.float32)
+        if "class_logits" in decoded and torch.is_tensor(decoded["class_logits"]):
+            class_prob = F.softmax(
+                decoded["class_logits"].detach().to(device=device, dtype=torch.float32),
+                dim=-1,
+            ).amax(dim=-1)
+            pred_scores = pred_scores * class_prob
+        pred_scores = pred_scores.clamp(0.0, 1.0)
+
+        for batch_idx, target in enumerate(targets):
+            if batch_idx >= batch_size:
+                break
+            gt_boxes = target["boxes"].to(device=device, dtype=torch.float32)
+            if gt_boxes.numel() == 0:
+                continue
+            if target.get("box_format", "cxcywh") == "cxcywh":
+                gt_boxes = cxcywh_to_xyxy(gt_boxes)
+            gt_boxes = gt_boxes.clamp(0.0, 1.0)
+
+            cur_boxes = pred_boxes[batch_idx].clamp(0.0, 1.0)
+            cur_scores = pred_scores[batch_idx]
+            if cur_boxes.numel() == 0:
+                quality = torch.zeros(gt_boxes.shape[0], device=device, dtype=torch.float32)
+            else:
+                ious = box_iou(gt_boxes, cur_boxes)
+                best_iou, best_idx = ious.max(dim=1)
+                matched_score = cur_scores[best_idx]
+                matched_score = torch.where(
+                    matched_score >= self.detection_conf_threshold,
+                    matched_score,
+                    torch.zeros_like(matched_score),
+                )
+                quality = torch.where(
+                    best_iou >= self.detection_iou_threshold,
+                    matched_score,
+                    torch.zeros_like(matched_score),
+                )
+
+            for box, score in zip(gt_boxes, quality):
+                # Missed or low-confidence objects get a stronger IR-alignment
+                # penalty, making detection feedback alter the fusion image.
+                hardness = (1.0 - score).clamp(0.0, 1.0)
+                value = self.detected_object_weight + (
+                    self.missed_object_weight - self.detected_object_weight
+                ) * hardness
+                x1, y1, x2, y2 = box.tolist()
+                left = max(0, min(width - 1, int(torch.floor(box.new_tensor(x1 * width)).item())))
+                top = max(0, min(height - 1, int(torch.floor(box.new_tensor(y1 * height)).item())))
+                right = max(left + 1, min(width, int(torch.ceil(box.new_tensor(x2 * width)).item())))
+                bottom = max(top + 1, min(height, int(torch.ceil(box.new_tensor(y2 * height)).item())))
+                attention[batch_idx, :, top:bottom, left:right] = torch.maximum(
+                    attention[batch_idx, :, top:bottom, left:right],
+                    value.to(device=device, dtype=dtype),
+                )
+
+        return attention
 
 FusionReconstructionLoss = DetectionAwareFusionLoss
 
@@ -321,6 +330,8 @@ class YOLOLikeDetectionLoss(nn.Module):
         obj_weight: float = 1.0,
         cls_weight: float = 1.0,
         noobj_weight: float = 0.1,
+        small_object_boost: float = 1.0,
+        small_object_area_threshold: float = 0.01,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -328,6 +339,8 @@ class YOLOLikeDetectionLoss(nn.Module):
         self.obj_weight = obj_weight
         self.cls_weight = cls_weight
         self.noobj_weight = noobj_weight
+        self.small_object_boost = small_object_boost
+        self.small_object_area_threshold = small_object_area_threshold
 
     def forward(
         self,
@@ -360,19 +373,31 @@ class YOLOLikeDetectionLoss(nn.Module):
             ious = box_iou(gt_xyxy, boxes_pred[batch_idx])
             best_iou, best_idx = ious.max(dim=1)
             pred_pos_boxes = boxes_pred[batch_idx, best_idx]
-            total_box = total_box + (1.0 - best_iou).mean()
-            total_box = total_box + F.l1_loss(
-                xyxy_to_cxcywh(pred_pos_boxes),
-                xyxy_to_cxcywh(gt_xyxy),
-            )
-            total_obj = total_obj + F.binary_cross_entropy(
+            target_cxcywh = xyxy_to_cxcywh(gt_xyxy)
+            pred_cxcywh = xyxy_to_cxcywh(pred_pos_boxes)
+            gt_area = (target_cxcywh[:, 2] * target_cxcywh[:, 3]).clamp_min(0.0)
+            small_weight = 1.0 + self.small_object_boost * (
+                self.small_object_area_threshold - gt_area
+            ).clamp_min(0.0) / self.small_object_area_threshold
+            total_box = total_box + ((1.0 - best_iou) * small_weight).mean()
+            l1_per_box = F.l1_loss(
+                pred_cxcywh,
+                target_cxcywh,
+                reduction="none",
+            ).mean(dim=1)
+            total_box = total_box + (l1_per_box * small_weight).mean()
+            obj_loss = F.binary_cross_entropy(
                 scores_pred[batch_idx, best_idx].clamp(1e-4, 1.0 - 1e-4),
                 torch.ones_like(best_iou),
+                reduction="none",
             )
-            total_cls = total_cls + F.cross_entropy(
+            total_obj = total_obj + (obj_loss * small_weight).mean()
+            cls_loss = F.cross_entropy(
                 class_logits[batch_idx, best_idx],
                 gt_labels.clamp(min=0, max=self.num_classes - 1),
+                reduction="none",
             )
+            total_cls = total_cls + (cls_loss * small_weight).mean()
             pos_count += gt_xyxy.shape[0]
 
             neg_mask = torch.ones(
@@ -412,35 +437,28 @@ class JointFusionDetectionLoss(nn.Module):
         fusion_weight: float = 1.0,
         detection_weight: float = 1.0,
         use_feedback: bool = True,
-        # target_max_weight: float = 0.8,
-        excess_weight: float = 0.25,
-        flat_smoothness_weight: float = 0.02,
-        ring_artifact_weight: float = 0.25,
-        thermal_preserve_weight: float = 1.2,
-        halo_artifact_weight: float = 0.25,
-        texture_blur_kernel: int = 5,
-        contrast_blur_kernel: int = 9,
-        thermal_margin: float = 0.03,
-        thermal_temperature: float = 18.0,
-        gradient_overshoot_margin: float = 0.01,
+        object_weight: float = 2.0,
+        background_weight: float = 1.0,
+        gradient_weight: float = 1.0,
+        ssim_weight: float = 0.5,
+        modal_specific_weight: float = 0.5,
+        small_object_boost: float = 1.0,
     ) -> None:
         super().__init__()
         self.fusion_weight = fusion_weight
         self.detection_weight = detection_weight
         self.use_feedback = use_feedback
         self.fusion_loss = DetectionAwareFusionLoss(
-            excess_weight=excess_weight,
-            flat_smoothness_weight=flat_smoothness_weight,
-            ring_artifact_weight=ring_artifact_weight,
-            thermal_preserve_weight=thermal_preserve_weight,
-            halo_artifact_weight=halo_artifact_weight,
-            texture_blur_kernel=texture_blur_kernel,
-            contrast_blur_kernel=contrast_blur_kernel,
-            thermal_margin=thermal_margin,
-            thermal_temperature=thermal_temperature,
-            gradient_overshoot_margin=gradient_overshoot_margin,
+            object_weight=object_weight,
+            background_weight=background_weight,
+            gradient_weight=gradient_weight,
+            ssim_weight=ssim_weight,
+            modal_specific_weight=modal_specific_weight,
         )
-        self.detection_loss = YOLOLikeDetectionLoss(num_classes=num_classes)
+        self.detection_loss = YOLOLikeDetectionLoss(
+            num_classes=num_classes,
+            small_object_boost=small_object_boost,
+        )
         self.feedback_weight = DetectionFeedbackLossWeight(base_lambda=detection_weight)
 
     def forward(
@@ -448,17 +466,20 @@ class JointFusionDetectionLoss(nn.Module):
         outputs: dict[str, object],
         ir: torch.Tensor,
         vis: torch.Tensor,
-        sam_mask: torch.Tensor | None,
         targets: list[dict[str, torch.Tensor]],
         use_feedback: bool | None = None,
     ) -> dict[str, torch.Tensor]:
-        fusion_terms = self.fusion_loss(outputs["I_fused"], ir, vis, targets, sam_mask)
-        decoded = outputs["detections"]["decoded"]
-        if outputs["detections"].get("trainable", True):
-            detection_terms = self.detection_loss(
-                decoded,
-                targets,
-            )
+        detections = outputs["detections"]
+        fusion_terms = self.fusion_loss(
+            outputs["I_fused"],
+            ir,
+            vis,
+            targets,
+            detections=detections,
+        )
+        decoded = detections["decoded"]
+        if detections.get("trainable", True):
+            detection_terms = self.detection_loss(decoded, targets)
         else:
             zero = outputs["I_fused"].new_tensor(0.0)
             detection_terms = {

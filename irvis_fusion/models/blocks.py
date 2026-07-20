@@ -4,8 +4,19 @@ import torch
 from torch import nn
 
 
+def _group_count(channels: int) -> int:
+    for groups in (32, 16, 8, 4, 2):
+        if channels % groups == 0 and channels // groups >= 4:
+            return groups
+    return 1
+
+
 class ConvBNAct(nn.Module):
-    """Conv-BN-ReLU block used by encoders, FPN, fusion, and decoder."""
+    """Conv-Norm-ReLU block used by encoders, FPN, fusion, and decoder.
+
+    GroupNorm is used instead of BatchNorm so batch-size-1 small-target training
+    and very small C5 maps remain stable.
+    """
 
     def __init__(
         self,
@@ -30,7 +41,7 @@ class ConvBNAct(nn.Module):
                 groups=groups,
                 bias=False,
             ),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
             nn.ReLU(inplace=True) if act else nn.Identity(),
         )
 

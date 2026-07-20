@@ -13,7 +13,7 @@ from .utils.losses import JointFusionDetectionLoss
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train SAM-guided detection-feedback IR/VIS fusion."
+        description="Train cross-modal QKV detection-feedback IR/VIS fusion."
     )
     parser.add_argument("--data-root", default="datasets/M3FD_Detection")
     parser.add_argument("--split", default="train")
@@ -22,22 +22,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--resnet-base-channels", type=int, default=64)
+    parser.add_argument("--fpn-channels", type=int, default=128)
+    parser.add_argument("--anchor-sizes", nargs=4, type=float, default=[8.0, 16.0, 32.0, 64.0])
+    parser.add_argument("--modal-specific-weight", type=float, default=0.5)
+    parser.add_argument("--small-object-boost", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-steps-per-epoch", type=int, default=0)
     parser.add_argument("--fusion-weight", type=float, default=1.0)
     parser.add_argument("--detection-weight", type=float, default=1.0)
-    # parser.add_argument("--target-max-weight", type=float, default=0.8)
-    parser.add_argument("--excess-weight", type=float, default=0.35)
-    parser.add_argument("--flat-smoothness-weight", type=float, default=0.02)
-    parser.add_argument("--ring-artifact-weight", type=float, default=0.25)
-    parser.add_argument("--thermal-preserve-weight", type=float, default=1.2)
-    parser.add_argument("--halo-artifact-weight", type=float, default=0.25)
-    parser.add_argument("--texture-blur-kernel", type=int, default=5)
-    parser.add_argument("--contrast-blur-kernel", type=int, default=9)
-    parser.add_argument("--thermal-margin", type=float, default=0.03)
-    parser.add_argument("--thermal-temperature", type=float, default=18.0)
-    parser.add_argument("--gradient-overshoot-margin", type=float, default=0.01)
-    parser.add_argument("--no-sam", action="store_true")
     parser.add_argument("--no-feedback", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", default="runs/irvis_sdif_feedback")
@@ -106,25 +99,18 @@ def main() -> None:
 
     model = IRVISFusionDetectionNet(
         num_classes=args.num_classes,
-        use_sam=not args.no_sam,
+        resnet_base_channels=args.resnet_base_channels,
+        fpn_channels=args.fpn_channels,
+        anchor_sizes=tuple(args.anchor_sizes),
         use_feedback=not args.no_feedback,
     ).to(device)
     criterion = JointFusionDetectionLoss(
         num_classes=args.num_classes,
         fusion_weight=args.fusion_weight,
         detection_weight=args.detection_weight,
+        modal_specific_weight=args.modal_specific_weight,
+        small_object_boost=args.small_object_boost,
         use_feedback=not args.no_feedback,
-        # target_max_weight=args.target_max_weight,
-        excess_weight=args.excess_weight,
-        flat_smoothness_weight=args.flat_smoothness_weight,
-        ring_artifact_weight=args.ring_artifact_weight,
-        thermal_preserve_weight=args.thermal_preserve_weight,
-        halo_artifact_weight=args.halo_artifact_weight,
-        texture_blur_kernel=args.texture_blur_kernel,
-        contrast_blur_kernel=args.contrast_blur_kernel,
-        thermal_margin=args.thermal_margin,
-        thermal_temperature=args.thermal_temperature,
-        gradient_overshoot_margin=args.gradient_overshoot_margin,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     start_epoch, global_step = load_training_checkpoint(
@@ -148,13 +134,11 @@ def main() -> None:
                 break
             ir = batch["ir"].to(device, non_blocking=True)
             vis = batch["vis"].to(device, non_blocking=True)
-            sam = batch["sam_mask"].to(device, non_blocking=True)
             targets = move_targets(batch["targets"], device)
 
             outputs = model(
                 ir,
                 vis,
-                sam_mask=sam,
                 targets=targets,
                 return_logs=True,
             )
@@ -162,7 +146,6 @@ def main() -> None:
                 outputs,
                 ir,
                 vis,
-                sam,
                 targets,
                 use_feedback=not args.no_feedback,
             )
@@ -179,7 +162,8 @@ def main() -> None:
             if step == 1 or step % 20 == 0:
                 print(
                     "epoch=[{}/{}] step=[{}/{}] loss={:.4f} fusion={:.4f} "
-                    "det={:.4f} excess={:.4f} smooth={:.4f} ring={:.4f} thermal={:.4f} halo={:.4f} "
+                    "det={:.4f} intensity={:.4f} grad={:.4f} ssim={:.4f} "
+                    "object={:.4f} "
                     "lambda_det={:.3f} recall={:.3f} conf={:.3f}".format(
                         epoch,
                         args.epochs,
@@ -188,11 +172,10 @@ def main() -> None:
                         float(losses["loss"].item()),
                         float(losses["fusion_loss"].item()),
                         float(losses["detection_loss"].item()),
-                        float(losses["excess_artifact_loss"].item()),
-                        float(losses["flat_smoothness_loss"].item()),
-                        float(losses["ring_artifact_loss"].item()),
-                        float(losses["thermal_preserve_loss"].item()),
-                        float(losses["halo_artifact_loss"].item()),
+                        float(losses["intensity_loss"].item()),
+                        float(losses["gradient_loss"].item()),
+                        float(losses["ssim_loss"].item()),
+                        float(losses["object_loss"].item()),
                         float(losses["lambda_det"].item()),
                         float(losses["detection_recall"].item()),
                         float(losses["detection_confidence"].item()),

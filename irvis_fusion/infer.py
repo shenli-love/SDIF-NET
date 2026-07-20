@@ -20,7 +20,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="val")
     parser.add_argument("--ir-image", default=None)
     parser.add_argument("--vis-image", default=None)
-    parser.add_argument("--sam-mask", default=None)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--output-dir", default="runs/infer")
     parser.add_argument("--output-image", default=None)
@@ -28,9 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--num-classes", type=int, default=6)
+    parser.add_argument("--resnet-base-channels", type=int, default=64)
+    parser.add_argument("--fpn-channels", type=int, default=128)
+    parser.add_argument("--anchor-sizes", nargs=4, type=float, default=[8.0, 16.0, 32.0, 64.0])
     parser.add_argument("--save-conf", type=float, default=0.15)
     parser.add_argument("--max-samples", type=int, default=0)
-    parser.add_argument("--no-sam", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -122,11 +123,8 @@ def infer_single_image_pair(
     image_size = tuple(args.image_size)
     ir = load_gray_tensor(args.ir_image, image_size).to(device)
     vis = load_gray_tensor(args.vis_image, image_size).to(device)
-    sam = None
-    if args.sam_mask is not None:
-        sam = load_gray_tensor(args.sam_mask, image_size).to(device)
 
-    outputs = model(ir, vis, sam_mask=sam, return_logs=False)
+    outputs = model(ir, vis, return_logs=False)
     fused_image = tensor_to_gray_image(outputs["I_fused"][0])
     output_image = (
         Path(args.output_image)
@@ -144,7 +142,9 @@ def main() -> None:
     device = torch.device(args.device)
     model = IRVISFusionDetectionNet(
         num_classes=args.num_classes,
-        use_sam=not args.no_sam,
+        resnet_base_channels=args.resnet_base_channels,
+        fpn_channels=args.fpn_channels,
+        anchor_sizes=tuple(args.anchor_sizes),
     ).to(device)
     load_checkpoint(model, args.checkpoint, device)
     model.eval()
@@ -179,8 +179,7 @@ def main() -> None:
     for batch in loader:
         ir = batch["ir"].to(device, non_blocking=True)
         vis = batch["vis"].to(device, non_blocking=True)
-        sam = batch["sam_mask"].to(device, non_blocking=True)
-        outputs = model(ir, vis, sam_mask=sam, return_logs=False)
+        outputs = model(ir, vis, return_logs=False)
         fused = outputs["I_fused"]
         decoded = outputs["detections"]["decoded"]
         results = model.detector.postprocess(decoded, conf_threshold=args.save_conf)

@@ -15,7 +15,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=191)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-classes", type=int, default=6)
-    parser.add_argument("--no-sam", action="store_true")
+    parser.add_argument("--resnet-base-channels", type=int, default=16)
+    parser.add_argument("--fpn-channels", type=int, default=64)
     parser.add_argument("--no-feedback", action="store_true")
     return parser.parse_args()
 
@@ -41,20 +42,20 @@ def main() -> None:
     torch.manual_seed(7)
     ir = torch.rand(args.batch_size, 1, args.height, args.width, device=device)
     vis = torch.rand(args.batch_size, 1, args.height, args.width, device=device)
-    sam = (torch.rand(args.batch_size, 1, args.height, args.width, device=device) > 0.55).float()
     targets = make_targets(args.batch_size, device)
 
     model = IRVISFusionDetectionNet(
         num_classes=args.num_classes,
-        use_sam=not args.no_sam,
+        resnet_base_channels=args.resnet_base_channels,
+        fpn_channels=args.fpn_channels,
         use_feedback=not args.no_feedback,
     ).to(device)
     criterion = JointFusionDetectionLoss(
         num_classes=args.num_classes,
         use_feedback=not args.no_feedback,
     )
-    outputs = model(ir, vis, sam_mask=sam, targets=targets)
-    losses = criterion(outputs, ir, vis, sam, targets, use_feedback=not args.no_feedback)
+    outputs = model(ir, vis, targets=targets)
+    losses = criterion(outputs, ir, vis, targets, use_feedback=not args.no_feedback)
     losses["loss"].backward()
 
     print("smoke_test=ok")

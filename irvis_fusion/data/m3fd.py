@@ -48,7 +48,7 @@ def _read_yolo_label(path: Path) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 class M3FDDataset(Dataset):
-    """M3FD IR/VIS/SAM/YOLO dataset reader."""
+    """M3FD IR/VIS/YOLO dataset reader."""
 
     def __init__(
         self,
@@ -57,7 +57,6 @@ class M3FDDataset(Dataset):
         image_size: tuple[int, int] | None = (768, 1024),
         ir_dir: str = "ir",
         vis_dir: str = "vi",
-        sam_dir: str = "sam_masks",
         labels_dir: str = "labels",
     ) -> None:
         self.root = Path(root)
@@ -69,7 +68,6 @@ class M3FDDataset(Dataset):
             self.ids = [line.strip() for line in handle if line.strip()]
         self.ir_root = self.root / ir_dir
         self.vis_root = self.root / vis_dir
-        self.sam_root = self.root / sam_dir
         self.labels_root = self.root / labels_dir
 
     def __len__(self) -> int:
@@ -81,11 +79,6 @@ class M3FDDataset(Dataset):
         vis = _resize_image(
             _load_grayscale(self.vis_root / f"{sample_id}.png"), self.image_size
         )
-        sam_path = self.sam_root / f"{sample_id}.png"
-        if sam_path.exists():
-            sam = _resize_image(_load_grayscale(sam_path), self.image_size)
-        else:
-            sam = torch.zeros_like(ir)
         boxes, labels = _read_yolo_label(self.labels_root / f"{sample_id}.txt")
         target = {
             "boxes": boxes,
@@ -93,13 +86,12 @@ class M3FDDataset(Dataset):
             "box_format": "cxcywh",
             "image_id": sample_id,
         }
-        return {"ir": ir, "vis": vis, "sam_mask": sam, "target": target}
+        return {"ir": ir, "vis": vis, "target": target}
 
 
 def detection_collate(batch: list[dict[str, object]]) -> dict[str, object]:
     return {
         "ir": torch.stack([item["ir"] for item in batch], dim=0),
         "vis": torch.stack([item["vis"] for item in batch], dim=0),
-        "sam_mask": torch.stack([item["sam_mask"] for item in batch], dim=0),
         "targets": [item["target"] for item in batch],
     }

@@ -62,8 +62,8 @@ def main() -> None:
     print(f"  形状: {tuple(image_tensor.shape)}")
 
     # 2. 实例化模型 (模型默认带有 requires_grad=True)
-    encoder = CNNEncoder(in_channels=1, channels=(32, 64, 128)).to(device)
-    fpn = FeaturePyramid(in_channels=(32, 64, 128), out_channels=128).to(device)
+    encoder = CNNEncoder(in_channels=1, base_channels=32).to(device)
+    fpn = FeaturePyramid(in_channels=encoder.out_channels, out_channels=128).to(device)
 
     # 设置为 eval 模式，模型内部不再跟踪梯度（但输出的张量依然会带有梯度历史，所以需要 detach）
     encoder.eval()
@@ -72,22 +72,24 @@ def main() -> None:
     # 3. Encoder 前向
     print("\n🔧 [1] 运行 CNNEncoder ...")
     with torch.no_grad():  # 加上这个上下文管理器更安全，直接禁用梯度计算
-        f1, f2, f3 = encoder(image_tensor)
+        f1, f2, f3, f4 = encoder(image_tensor)
 
     # 保存 Encoder 输出
     save_feature_map(f1, out_dir / "01_Stage1_f1.png", "Stage1 (f1)")
     save_feature_map(f2, out_dir / "02_Stage2_f2.png", "Stage2 (f2)")
     save_feature_map(f3, out_dir / "03_Stage3_f3.png", "Stage3 (f3)")
+    save_feature_map(f4, out_dir / "04_Stage4_f4.png", "Stage4 (f4)")
 
     # 4. FPN 前向
     print("\n🔧 [2] 运行 FeaturePyramid ...")
     with torch.no_grad():
-        p1, p2, p3 = fpn((f1, f2, f3))
+        p1, p2, p3, p4 = fpn((f1, f2, f3, f4))
 
     # 保存 FPN 输出
-    save_feature_map(p1, out_dir / "04_FPN_P1.png", "FPN P1")
-    save_feature_map(p2, out_dir / "05_FPN_P2.png", "FPN P2")
-    save_feature_map(p3, out_dir / "06_FPN_P3.png", "FPN P3")
+    save_feature_map(p1, out_dir / "05_FPN_P2.png", "FPN P2")
+    save_feature_map(p2, out_dir / "06_FPN_P3.png", "FPN P3")
+    save_feature_map(p3, out_dir / "07_FPN_P4.png", "FPN P4")
+    save_feature_map(p4, out_dir / "08_FPN_P5.png", "FPN P5")
 
     print("\n🎉 可视化拆解完成！")
     print("💡 观察建议：")

@@ -1,18 +1,17 @@
-# SQUA-Net: SAM-QKV Detection-aware IR-VIS Fusion
+# SDIF-Net: Cross-modal QKV Detection-aware IR-VIS Fusion
 
 This project implements a trainable PyTorch pipeline for infrared-visible image
 fusion and detection-guided optimization.
 
 ## What Is Included
 
-- independent IR and VIS CNN encoders
-- FPN top-down multi-scale enhancement
-- `SAMPriorEncoder` for a soft SAM attention prior
-- small-target-aware three-scale SQUA fusion over FPN features
+- independent IR and VIS ResNet-50 style bottleneck encoders
+- P2-P5 FPN top-down multi-scale enhancement
+- four-scale bidirectional cross-modal QKV fusion over FPN features
 - FPN-style decoder that reconstructs `I_fused`
-- compact YOLO-like dense detection head for differentiable joint training
+- anchor-based dense detection head with small P2 anchors for differentiable joint training
 - detection feedback as a dynamic detection-loss weight
-- ablation switches: `use_sam`, `use_feedback`
+- ablation switch: `use_feedback`
 
 ## Data Layout
 
@@ -22,7 +21,6 @@ The default reader targets the current M3FD-style structure:
 datasets/M3FD_Detection
 |__ ir
 |__ vi
-|__ sam_masks
 |__ labels
 |__ meta/train.txt
 |__ meta/val.txt
@@ -48,13 +46,13 @@ python -m irvis_fusion.train ^
   --image-size 768 1024 ^
   --batch-size 1 ^
   --epochs 20 ^
-  --num-classes 6
+  --num-classes 6 ^
+  --anchor-sizes 8 16 32 64
 ```
 
 Disable modules for ablation:
 
 ```bash
-python -m irvis_fusion.train --no-sam
 python -m irvis_fusion.train --no-feedback
 ```
 
@@ -80,18 +78,24 @@ Inference saves:
 
 - `I_fused`: reconstructed fused image
 - `detections`: raw and decoded detector predictions
-- `fused_features`: level1, level2, level3 fused features
-- `sam_attention`: soft SAM prior `A_sam`
-- `forward_logs`: confirms the single-pass SQUA pipeline
+- `fused_features`: P2, P3, P4, P5 fused features
+- `forward_logs`: confirms the single-pass bidirectional cross-modal QKV pipeline
 
-## Detector
+## Enhanced Architecture
 
-The built-in YOLO-like detector is trainable and keeps the fusion/detection
-objective fully differentiable.
+The network now follows the requested dual-stream, FPN, bidirectional QKV, dual-head
+architecture. IR and VIS are encoded by independent ResNet-50 style bottleneck
+branches and converted into P2-P5 pyramids. Each pyramid level runs two explicit
+cross-modal QKV paths: IR queries VIS keys/values and VIS queries IR keys/values.
+The fusion projection receives both cross-attention responses plus the original
+IR/VIS FPN features through a gated residual path, preserving modality-specific
+thermal and texture evidence instead of collapsing everything into a one-way
+attention map.
 
-SQUA avoids full-image softmax suppression by mixing local-window contrast
-attention with global context. It also learns a region-adaptive IR/VIS modality
-gate, giving IR stronger influence in locally salient thermal regions.
+The detector consumes the fused P2-P5 features directly. P2 is configured with
+an 8-pixel base anchor by default, followed by 16, 32, and 64 pixels on deeper
+levels, with configurable aspect ratios. This keeps the training path compact
+while explicitly biasing the model toward far small pedestrians and vehicles.
 
 The detector keeps this return contract:
 
@@ -107,11 +111,14 @@ The detector keeps this return contract:
 ```
 
 The loss consumes decoded fields, applies GT-box spatial weighting to the
-fusion image, and computes:
+fusion image, and computes a compact objective:
 
 ```text
 L_total = L_fusion + lambda_det * L_detection
 ```
+
+`L_fusion` is grouped into four terms: intensity preservation, gradient
+preservation, SSIM structure, and modal-specific information preservation.
 
 When `use_feedback=True`, `lambda_det` increases for low recall or low detection
 confidence. Detection feedback is used only in the loss path and does not enter
