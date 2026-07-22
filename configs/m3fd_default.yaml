@@ -4,6 +4,7 @@ image_size: [768, 1024]
 num_classes: 6
 batch_size: 1
 epochs: 20
+save_every: 2
 lr: 0.0001
 use_feedback: true
 fusion_weight: 1.0
@@ -12,5 +13,6 @@ resnet_base_channels: 64
 fpn_channels: 128
 anchor_sizes: [8.0, 16.0, 32.0, 64.0]
 anchor_ratios: [0.5, 1.0, 2.0]
-modal_specific_weight: 0.5
+gradient_weight: 3.0
+max_rule_weight: 2.0
 small_object_boost: 1.0

@@ -10,12 +10,14 @@ from torch.utils.data import DataLoader
 
 from .data import M3FDDataset, detection_collate
 from .models import IRVISFusionDetectionNet
+from .utils.config import load_flat_yaml_config
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run IR/VIS fusion inference and save fused images/detections."
     )
+    parser.add_argument("--config", default=None)
     parser.add_argument("--data-root", default="datasets/M3FD_Detection")
     parser.add_argument("--split", default="val")
     parser.add_argument("--ir-image", default=None)
@@ -30,10 +32,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resnet-base-channels", type=int, default=64)
     parser.add_argument("--fpn-channels", type=int, default=128)
     parser.add_argument("--anchor-sizes", nargs=4, type=float, default=[8.0, 16.0, 32.0, 64.0])
+    parser.add_argument("--anchor-ratios", nargs="+", type=float, default=[0.5, 1.0, 2.0])
     parser.add_argument("--save-conf", type=float, default=0.15)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=None)
+    config_args, remaining = config_parser.parse_known_args()
+
+    parser = build_parser()
+    config = load_flat_yaml_config(config_args.config)
+    if config:
+        valid_keys = {action.dest for action in parser._actions}
+        parser.set_defaults(**{key: value for key, value in config.items() if key in valid_keys})
+    args = parser.parse_args(remaining)
+    args.config = config_args.config
+    return args
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: str | None, device: torch.device) -> None:
@@ -145,6 +163,7 @@ def main() -> None:
         resnet_base_channels=args.resnet_base_channels,
         fpn_channels=args.fpn_channels,
         anchor_sizes=tuple(args.anchor_sizes),
+        anchor_ratios=tuple(args.anchor_ratios),
     ).to(device)
     load_checkpoint(model, args.checkpoint, device)
     model.eval()

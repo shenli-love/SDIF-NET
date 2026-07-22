@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .decoder import FusionDecoder
+from .decoder import DetailPreservingDecoder
 from .detector import YOLOLikeHead
 from .encoder import ResNet50Encoder
 from .fpn import FeaturePyramid
@@ -11,7 +11,10 @@ from .fusion import CrossModalQKVUnifiedFusion
 
 
 class IRVISFusionDetectionNet(nn.Module):
-    """End-to-end fusion network: dual ResNet encoders -> FPN -> QKV fusion -> dual heads."""
+    """端到端融合检测网络。
+
+    架构: 双ResNet编码 → 双FPN → 通道交叉注意力融合 → 细节保持解码 → 检测头
+    """
 
     def __init__(
         self,
@@ -33,8 +36,8 @@ class IRVISFusionDetectionNet(nn.Module):
         encoder_channels = encoder_channels or self.ir_encoder.out_channels
         self.ir_fpn = FeaturePyramid(encoder_channels, fpn_channels)
         self.vis_fpn = FeaturePyramid(encoder_channels, fpn_channels)
-        self.fusion = CrossModalQKVUnifiedFusion(fpn_channels, num_scales=4)
-        self.decoder = FusionDecoder(fpn_channels, fused_channels)
+        self.fusion = CrossModalQKVUnifiedFusion(fpn_channels, num_scales=4, num_heads=4)
+        self.decoder = DetailPreservingDecoder(fpn_channels, fused_channels)
         self.detector = YOLOLikeHead(
             fused_channels=fpn_channels,
             use_fused_features=True,
@@ -58,13 +61,16 @@ class IRVISFusionDetectionNet(nn.Module):
         ir_features = self.ir_fpn(self.ir_encoder(ir))
         vis_features = self.vis_fpn(self.vis_encoder(vis))
 
-        fused_features = self.fusion(
-            ir_features,
-            vis_features,
+        fused_features = self.fusion(ir_features, vis_features)
+
+        # 解码器接收原始图像用于细节跳跃
+        fused_image = self.decoder(
+            fused_features,
+            ir_image=ir,
+            vis_image=vis,
+            output_size=ir.shape[-2:],
         )
-        
-        fused_image = self.decoder(fused_features, output_size=ir.shape[-2:])
-        
+
         # Detector directly consumes multi-scale fused features.
         detection_outputs = self.detector(image=None, fused_features=fused_features)
 
@@ -76,9 +82,9 @@ class IRVISFusionDetectionNet(nn.Module):
         }
         if return_logs:
             output["forward_logs"] = {
-                "pipeline": "encoder->fpn->cross_modal_qkv_fusion->decoder->detector",
+                "pipeline": "encoder->fpn->cross_attention_fusion->detail_decoder->detector",
                 "fpn_levels": "P2-P5",
-                "detector": "anchor_dense_small_object",
+                "detector": "anchor_dense",
                 "mode": "single_pass",
                 "feedback_path": "loss_only",
             }

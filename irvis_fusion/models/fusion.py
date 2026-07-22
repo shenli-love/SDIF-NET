@@ -5,119 +5,133 @@ import torch.nn.functional as F
 from torch import nn
 
 
-class CrossModalQKVFusion(nn.Module):
-    """Bidirectional cross-modal QKV attention for one FPN level.
+class ChannelCrossAttention(nn.Module):
+    """通道级跨模态注意力（带大特征图自动降采样）。
 
-    Both directions are preserved explicitly:
-
-    - IR-to-VIS: IR query retrieves VIS key/value detail.
-    - VIS-to-IR: VIS query retrieves IR key/value detail.
-
-    The output projection receives the two cross-attention responses and the
-    original modal FPN features through a residual fusion path, which prevents
-    one direction from suppressing modality-specific evidence.
+    对于空间尺寸 > max_attn_size 的特征图，先降采样再计算注意力，
+    然后将注意力图 upsample 回原始尺寸，避免 O(H^2 W^2) 显存爆炸。
     """
 
-    def __init__(self, channels: int, local_windows: tuple[int, ...] = (3, 7, 11)) -> None:
+    def __init__(self, channels: int, num_heads: int = 4, max_attn_size: int = 32) -> None:
         super().__init__()
-        self.scale = channels ** -0.5
-        self.local_windows = local_windows
-        self.q_ir_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.k_ir_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.v_ir_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.q_vis_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.k_vis_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.v_vis_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.local_global_mix = nn.Parameter(torch.tensor(1.0))
-        self.modality_gate = nn.Sequential(
-            nn.Conv2d(channels * 4 + 1, channels, kernel_size=1),
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.max_attn_size = max_attn_size
+
+        self.q_proj = nn.Conv2d(channels, channels, 1)
+        self.k_proj = nn.Conv2d(channels, channels, 1)
+        self.v_proj = nn.Conv2d(channels, channels, 1)
+        self.out_proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, query_feat: torch.Tensor, kv_feat: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = query_feat.shape
+
+        # 判断是否需要降采样
+        need_downsample = H > self.max_attn_size or W > self.max_attn_size
+
+        if need_downsample:
+            # 计算降采样目标尺寸
+            scale_h = min(self.max_attn_size / H, 1.0)
+            scale_w = min(self.max_attn_size / W, 1.0)
+            scale = min(scale_h, scale_w)
+            new_h = max(int(H * scale), 4)
+            new_w = max(int(W * scale), 4)
+
+            q_input = F.interpolate(query_feat, size=(new_h, new_w), mode="bilinear", align_corners=False)
+            kv_input = F.interpolate(kv_feat, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        else:
+            q_input = query_feat
+            kv_input = kv_feat
+            new_h, new_w = H, W
+
+        q = self.q_proj(q_input).view(B, self.num_heads, self.head_dim, new_h * new_w)
+        k = self.k_proj(kv_input).view(B, self.num_heads, self.head_dim, new_h * new_w)
+        v = self.v_proj(kv_input).view(B, self.num_heads, self.head_dim, new_h * new_w)
+
+        # [B, heads, HW, HW] — 空间注意力
+        attn = torch.einsum("bhdn,bhdm->bhnm", q, k) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        out = torch.einsum("bhnm,bhdm->bhdn", attn, v)
+        out = out.reshape(B, C, new_h, new_w)
+
+        # 如果降采样了，需要 upsample 回原始尺寸
+        if need_downsample:
+            out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
+
+        return self.out_proj(out)
+
+
+class SpatialGateFusion(nn.Module):
+    """空间级门控融合：学习每个像素从哪个模态取多少信息。"""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.gate_net = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, 4, kernel_size=1),
+            nn.Conv2d(channels, 2, 1),
         )
-        self.base_proj = nn.Conv2d(channels * 4, channels, kernel_size=1)
-        self.out = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+
+    def forward(self, ir_feat: torch.Tensor, vis_feat: torch.Tensor) -> torch.Tensor:
+        combined = torch.cat([ir_feat, vis_feat], dim=1)
+        gates = torch.softmax(self.gate_net(combined), dim=1)
+        return gates[:, 0:1] * ir_feat + gates[:, 1:2] * vis_feat
+
+
+class CrossModalFusionBlock(nn.Module):
+    """单层跨模态融合：通道注意力 + 空间门控 + 残差。"""
+
+    def __init__(self, channels: int, num_heads: int = 4, max_attn_size: int = 32) -> None:
+        super().__init__()
+        self.ir_attend_vis = ChannelCrossAttention(channels, num_heads, max_attn_size)
+        self.vis_attend_ir = ChannelCrossAttention(channels, num_heads, max_attn_size)
+        self.spatial_gate = SpatialGateFusion(channels)
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
         )
-        # Preserve absolute response levels for the decoder; instance norm was
-        # washing out modality brightness and made fused images drift gray.
-        self.norm = nn.Identity()
+        self.act = nn.ReLU(inplace=True)
 
-    def _hybrid_attention(self, score: torch.Tensor) -> torch.Tensor:
-        local_maps = []
-        for window in self.local_windows:
-            local_score = F.max_pool2d(
-                score,
-                kernel_size=window,
-                stride=1,
-                padding=window // 2,
-            )
-            local_maps.append(torch.sigmoid(local_score))
+    def forward(self, ir: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
+        # 通道级跨模态交互
+        ir_enhanced = ir + self.ir_attend_vis(ir, vis)
+        vis_enhanced = vis + self.vis_attend_ir(vis, ir)
 
-        local_attn = torch.stack(local_maps, dim=0).mean(dim=0)
-        global_attn = torch.sigmoid(score.mean(dim=(-2, -1), keepdim=True))
-        local_weight = torch.sigmoid(self.local_global_mix)
+        # 空间门控选择
+        fused = self.spatial_gate(ir_enhanced, vis_enhanced)
 
-        return local_weight * local_attn + (1.0 - local_weight) * global_attn
-
-    def forward(
-        self,
-        ir: torch.Tensor,
-        vis: torch.Tensor,
-    ) -> torch.Tensor:
-        ir_cond = ir
-        vis_cond = vis
-
-        q_ir = self.q_ir_proj(ir_cond)
-        k_vis = self.k_vis_proj(vis_cond)
-        v_vis = self.v_vis_proj(vis_cond)
-
-        q_vis = self.q_vis_proj(vis_cond)
-        k_ir = self.k_ir_proj(ir_cond)
-        v_ir = self.v_ir_proj(ir_cond)
-
-        score_ir_to_vis = (q_ir * k_vis).sum(dim=1, keepdim=True) * self.scale
-        score_vis_to_ir = (q_vis * k_ir).sum(dim=1, keepdim=True) * self.scale
-        attn_ir_to_vis = self._hybrid_attention(score_ir_to_vis)
-        attn_vis_to_ir = self._hybrid_attention(score_vis_to_ir)
-
-        cross_vis = attn_ir_to_vis * v_vis
-        cross_ir = attn_vis_to_ir * v_ir
-        difference_energy = (ir - vis).abs().mean(dim=1, keepdim=True)
-        fusion_sources = torch.cat([ir, vis, cross_ir, cross_vis], dim=1)
-        gates = torch.softmax(
-            self.modality_gate(torch.cat([fusion_sources, difference_energy], dim=1)),
-            dim=1,
-        )
-        gated_sources = torch.cat(
-            [
-                gates[:, 0:1] * ir,
-                gates[:, 1:2] * vis,
-                gates[:, 2:3] * cross_ir,
-                gates[:, 3:4] * cross_vis,
-            ],
-            dim=1,
-        )
-        fused = self.base_proj(gated_sources)
-        fused = fused + 0.5 * (ir + vis)
-        fused = self.norm(fused)
-        return self.out(fused)
+        # 残差精炼
+        fused = fused + self.refine(fused)
+        return self.act(fused)
 
 
 class CrossModalQKVUnifiedFusion(nn.Module):
-    """Multi-scale wrapper around bidirectional cross-modal QKV fusion.
+    """多尺度跨模态融合，P2-P5 各一个独立融合块。
 
     F_fuse = f(F_ir, F_vis)
+
+    对 P2/P3 大特征图使用降采样注意力 (max_attn_size=32)，
+    对 P4/P5 小特征图使用完整注意力。
 
     Detection feedback is intentionally absent from this forward path. It is
     handled by the training objective as a dynamic detection-loss weight.
     """
 
-    def __init__(self, channels: int = 128, num_scales: int = 4) -> None:
+    def __init__(self, channels: int = 128, num_scales: int = 4, num_heads: int = 4) -> None:
         super().__init__()
+        # P2, P3 用降采样注意力; P4, P5 用完整注意力
+        attn_sizes = [32, 32, 64, 128]
         self.operators = nn.ModuleList(
-            [CrossModalQKVFusion(channels) for _ in range(num_scales)]
+            [
+                CrossModalFusionBlock(channels, num_heads, max_attn_size=attn_sizes[i])
+                for i in range(num_scales)
+            ]
         )
 
     def forward(
@@ -127,8 +141,7 @@ class CrossModalQKVUnifiedFusion(nn.Module):
     ) -> tuple[torch.Tensor, ...]:
         if len(ir_features) != len(vis_features) or len(ir_features) != len(self.operators):
             raise ValueError("CrossModalQKVUnifiedFusion expects aligned P2-P5 FPN scales.")
-        fused = [
-            operator(ir, vis)
-            for operator, ir, vis in zip(self.operators, ir_features, vis_features)
-        ]
-        return tuple(fused)  # type: ignore[return-value]
+        return tuple(
+            op(ir, vis)
+            for op, ir, vis in zip(self.operators, ir_features, vis_features)
+        )

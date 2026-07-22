@@ -8,13 +8,15 @@ from torch.utils.data import DataLoader
 
 from .data import M3FDDataset, detection_collate
 from .models import IRVISFusionDetectionNet
+from .utils.config import load_flat_yaml_config
 from .utils.losses import JointFusionDetectionLoss
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train cross-modal QKV detection-feedback IR/VIS fusion."
     )
+    parser.add_argument("--config", default=None)
     parser.add_argument("--data-root", default="datasets/M3FD_Detection")
     parser.add_argument("--split", default="train")
     parser.add_argument("--image-size", nargs=2, type=int, default=[768, 1024])
@@ -25,7 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resnet-base-channels", type=int, default=64)
     parser.add_argument("--fpn-channels", type=int, default=128)
     parser.add_argument("--anchor-sizes", nargs=4, type=float, default=[8.0, 16.0, 32.0, 64.0])
-    parser.add_argument("--modal-specific-weight", type=float, default=0.5)
+    parser.add_argument("--anchor-ratios", nargs="+", type=float, default=[0.5, 1.0, 2.0])
+    parser.add_argument("--gradient-weight", type=float, default=3.0)
+    parser.add_argument("--max-rule-weight", type=float, default=2.0)
     parser.add_argument("--small-object-boost", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-steps-per-epoch", type=int, default=0)
@@ -36,7 +40,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="runs/irvis_sdif_feedback")
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--resume", default=None)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=None)
+    config_args, remaining = config_parser.parse_known_args()
+
+    parser = build_parser()
+    config = load_flat_yaml_config(config_args.config)
+    if config:
+        valid_keys = {action.dest for action in parser._actions}
+        parser.set_defaults(**{key: value for key, value in config.items() if key in valid_keys})
+    args = parser.parse_args(remaining)
+    args.config = config_args.config
+    return args
 
 
 def move_targets(
@@ -102,13 +121,15 @@ def main() -> None:
         resnet_base_channels=args.resnet_base_channels,
         fpn_channels=args.fpn_channels,
         anchor_sizes=tuple(args.anchor_sizes),
+        anchor_ratios=tuple(args.anchor_ratios),
         use_feedback=not args.no_feedback,
     ).to(device)
     criterion = JointFusionDetectionLoss(
         num_classes=args.num_classes,
         fusion_weight=args.fusion_weight,
         detection_weight=args.detection_weight,
-        modal_specific_weight=args.modal_specific_weight,
+        gradient_weight=args.gradient_weight,
+        max_rule_weight=args.max_rule_weight,
         small_object_boost=args.small_object_boost,
         use_feedback=not args.no_feedback,
     )
