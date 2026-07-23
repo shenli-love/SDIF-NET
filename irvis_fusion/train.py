@@ -7,14 +7,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import M3FDDataset, detection_collate
-from .models import IRVISFusionDetectionNet
+from .models import IRVISFusionDetectionNetV2
 from .utils.config import load_flat_yaml_config
-from .utils.losses import JointFusionDetectionLoss
+from .utils.losses import JointLossV2
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train cross-modal QKV detection-feedback IR/VIS fusion."
+        description="Train detection-guided closed-loop IR/VIS fusion (V2)."
     )
     parser.add_argument("--config", default=None)
     parser.add_argument("--data-root", default="datasets/M3FD_Detection")
@@ -35,9 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps-per-epoch", type=int, default=0)
     parser.add_argument("--fusion-weight", type=float, default=1.0)
     parser.add_argument("--detection-weight", type=float, default=1.0)
-    parser.add_argument("--no-feedback", action="store_true")
+    parser.add_argument("--saliency-weight", type=float, default=0.5)
+    parser.add_argument("--modal-weight", type=float, default=0.3)
+    parser.add_argument("--no-feedback-loop", action="store_true",
+                        help="Disable feature-level feedback loop (use single-pass mode)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output-dir", default="runs/irvis_sdif_feedback")
+    parser.add_argument("--output-dir", default="runs/irvis_sdif_v2")
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--resume", default=None)
     return parser
@@ -116,22 +119,23 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    model = IRVISFusionDetectionNet(
+    model = IRVISFusionDetectionNetV2(
         num_classes=args.num_classes,
         resnet_base_channels=args.resnet_base_channels,
         fpn_channels=args.fpn_channels,
         anchor_sizes=tuple(args.anchor_sizes),
         anchor_ratios=tuple(args.anchor_ratios),
-        use_feedback=not args.no_feedback,
+        use_feedback_loop=not args.no_feedback_loop,
     ).to(device)
-    criterion = JointFusionDetectionLoss(
+    criterion = JointLossV2(
         num_classes=args.num_classes,
         fusion_weight=args.fusion_weight,
         detection_weight=args.detection_weight,
+        saliency_weight=args.saliency_weight,
+        modal_weight=args.modal_weight,
         gradient_weight=args.gradient_weight,
         max_rule_weight=args.max_rule_weight,
         small_object_boost=args.small_object_boost,
-        use_feedback=not args.no_feedback,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     start_epoch, global_step = load_training_checkpoint(
@@ -168,7 +172,8 @@ def main() -> None:
                 ir,
                 vis,
                 targets,
-                use_feedback=not args.no_feedback,
+                ir_features=outputs["ir_features"],
+                vis_features=outputs["vis_features"],
             )
             loss = losses["loss"]
 
@@ -183,9 +188,9 @@ def main() -> None:
             if step == 1 or step % 20 == 0:
                 print(
                     "epoch=[{}/{}] step=[{}/{}] loss={:.4f} fusion={:.4f} "
-                    "det={:.4f} intensity={:.4f} grad={:.4f} ssim={:.4f} "
-                    "object={:.4f} "
-                    "lambda_det={:.3f} recall={:.3f} conf={:.3f}".format(
+                    "det={:.4f} sal={:.4f} modal={:.4f} "
+                    "intensity={:.4f} grad={:.4f} ssim={:.4f} "
+                    "object={:.4f}".format(
                         epoch,
                         args.epochs,
                         step,
@@ -193,13 +198,12 @@ def main() -> None:
                         float(losses["loss"].item()),
                         float(losses["fusion_loss"].item()),
                         float(losses["detection_loss"].item()),
+                        float(losses["saliency_loss"].item()),
+                        float(losses["modal_weight_loss"].item()),
                         float(losses["intensity_loss"].item()),
                         float(losses["gradient_loss"].item()),
                         float(losses["ssim_loss"].item()),
                         float(losses["object_loss"].item()),
-                        float(losses["lambda_det"].item()),
-                        float(losses["detection_recall"].item()),
-                        float(losses["detection_confidence"].item()),
                     )
                 )
 

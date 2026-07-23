@@ -340,3 +340,214 @@ class JointFusionDetectionLoss(nn.Module):
             **detection_terms,
             **feedback_terms,
         }
+
+
+# =============================================================================
+# 新版：显著性监督损失 + 闭环联合损失
+# =============================================================================
+
+
+class SaliencySupervisionLoss(nn.Module):
+    """用 GT 框生成高斯显著性图，监督 TaskSaliencyPredictor。
+
+    同时用 GT 框内 IR/VIS 的特征能量比来监督 modal_weight，
+    确保模态权重预测器学到“哪个模态在目标区域更有信息量”。
+    """
+
+    def __init__(self, sigma_factor: float = 0.25) -> None:
+        super().__init__()
+        self.sigma_factor = sigma_factor
+
+    def forward(
+        self,
+        saliency_maps: tuple[torch.Tensor, ...],
+        modal_weights: tuple[torch.Tensor, ...],
+        ir_features: tuple[torch.Tensor, ...],
+        vis_features: tuple[torch.Tensor, ...],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        device = saliency_maps[0].device
+        dtype = saliency_maps[0].dtype
+        total_sal_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        total_modal_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        num_scales = len(saliency_maps)
+
+        for scale_idx in range(num_scales):
+            pred_sal = saliency_maps[scale_idx]
+            B, _, H, W = pred_sal.shape
+
+            # 生成 GT 高斯显著性图
+            gt_sal = self._build_gaussian_saliency(targets, B, H, W, device, dtype)
+            total_sal_loss = total_sal_loss + F.binary_cross_entropy(
+                pred_sal.clamp(1e-6, 1 - 1e-6), gt_sal, reduction="mean"
+            )
+
+            # 生成模态权重监督
+            pred_mw = modal_weights[scale_idx]
+            gt_mw = self._build_modal_weight(
+                ir_features[scale_idx], vis_features[scale_idx], B, H, W
+            )
+            total_modal_loss = total_modal_loss + F.l1_loss(pred_mw, gt_mw)
+
+        return {
+            "saliency_loss": total_sal_loss / num_scales,
+            "modal_weight_loss": total_modal_loss / num_scales,
+        }
+
+    def _build_gaussian_saliency(
+        self,
+        targets: list[dict[str, torch.Tensor]],
+        B: int,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """GT 框中心生成高斯响应图作为显著性监督。"""
+        sal = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+        for b, target in enumerate(targets):
+            if b >= B:
+                break
+            boxes = target["boxes"].to(device=device, dtype=torch.float32)
+            if boxes.numel() == 0:
+                continue
+            if target.get("box_format", "cxcywh") == "cxcywh":
+                boxes = cxcywh_to_xyxy(boxes)
+            boxes = boxes.clamp(0, 1)
+            for box in boxes:
+                cx = ((box[0] + box[2]) / 2 * W).long().clamp(0, W - 1)
+                cy = ((box[1] + box[3]) / 2 * H).long().clamp(0, H - 1)
+                bw = ((box[2] - box[0]) * W).clamp(min=1)
+                bh = ((box[3] - box[1]) * H).clamp(min=1)
+                sigma = max(float(bw), float(bh)) * self.sigma_factor
+                sigma = max(sigma, 1e-3)
+                yy = torch.arange(H, device=device, dtype=dtype)
+                xx = torch.arange(W, device=device, dtype=dtype)
+                gy = torch.exp(-0.5 * ((yy - cy.float()) / sigma) ** 2)
+                gx = torch.exp(-0.5 * ((xx - cx.float()) / sigma) ** 2)
+                gaussian = gy.unsqueeze(1) * gx.unsqueeze(0)
+                sal[b, 0] = torch.maximum(sal[b, 0], gaussian)
+        return sal.clamp(0, 1)
+
+    def _build_modal_weight(
+        self,
+        ir_feat: torch.Tensor,
+        vis_feat: torch.Tensor,
+        B: int,
+        H: int,
+        W: int,
+    ) -> torch.Tensor:
+        """基于特征能量比生成模态权重监督。"""
+        device = ir_feat.device
+        dtype = ir_feat.dtype
+        # detach 避免梯度回传到编码器
+        ir_energy = ir_feat.detach().abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        vis_energy = vis_feat.detach().abs().mean(dim=1, keepdim=True)
+        total_e = ir_energy + vis_energy + 1e-6
+        mw = torch.zeros(B, 2, H, W, device=device, dtype=dtype)
+        mw[:, 0:1] = ir_energy / total_e
+        mw[:, 1:2] = vis_energy / total_e
+        return mw
+
+
+class JointLossV2(nn.Module):
+    """闭环检测引导融合网络的联合损失。
+
+    组成:
+        L_total = w_fusion * L_fusion
+                + w_det * L_detection
+                + w_sal * L_saliency
+                + w_modal * L_modal_weight
+
+    与旧版 JointFusionDetectionLoss 的区别:
+    - 移除了 DetectionFeedbackLossWeight (λ_det 标量机制)
+    - 新增 SaliencySupervisionLoss 确保显著性预测器学到检测语义
+    - 检测引导已在特征层面实现，不再需要损失层面的间接调节
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        fusion_weight: float = 1.0,
+        detection_weight: float = 1.0,
+        saliency_weight: float = 0.5,
+        modal_weight: float = 0.3,
+        gradient_weight: float = 3.0,
+        ssim_weight: float = 1.0,
+        max_rule_weight: float = 2.0,
+        small_object_boost: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.fusion_weight = fusion_weight
+        self.detection_weight = detection_weight
+        self.saliency_weight = saliency_weight
+        self.modal_weight_coef = modal_weight
+
+        self.fusion_loss = MaxRuleFusionLoss(
+            gradient_weight=gradient_weight,
+            ssim_weight=ssim_weight,
+            max_rule_weight=max_rule_weight,
+        )
+        self.detection_loss = YOLOLikeDetectionLoss(
+            num_classes=num_classes,
+            small_object_boost=small_object_boost,
+        )
+        self.saliency_loss = SaliencySupervisionLoss()
+
+    def forward(
+        self,
+        outputs: dict[str, object],
+        ir: torch.Tensor,
+        vis: torch.Tensor,
+        targets: list[dict[str, torch.Tensor]],
+        ir_features: tuple[torch.Tensor, ...] | None = None,
+        vis_features: tuple[torch.Tensor, ...] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        detections = outputs["detections"]
+
+        # 融合重建损失
+        fusion_terms = self.fusion_loss(
+            outputs["I_fused"], ir, vis, targets, detections=detections
+        )
+
+        # 检测损失
+        decoded = detections["decoded"]
+        if detections.get("trainable", True):
+            detection_terms = self.detection_loss(decoded, targets)
+        else:
+            zero = outputs["I_fused"].new_tensor(0.0)
+            detection_terms = {
+                "detection_loss": zero,
+                "box_loss": zero,
+                "obj_loss": zero,
+                "cls_loss": zero,
+                "noobj_loss": zero,
+                "positive_count": zero,
+            }
+
+        # 显著性监督损失
+        if ir_features is not None and vis_features is not None:
+            saliency_terms = self.saliency_loss(
+                outputs["saliency_maps"],
+                outputs["modal_weights"],
+                ir_features,
+                vis_features,
+                targets,
+            )
+        else:
+            zero = outputs["I_fused"].new_tensor(0.0)
+            saliency_terms = {"saliency_loss": zero, "modal_weight_loss": zero}
+
+        total = (
+            self.fusion_weight * fusion_terms["fusion_loss"]
+            + self.detection_weight * detection_terms["detection_loss"]
+            + self.saliency_weight * saliency_terms["saliency_loss"]
+            + self.modal_weight_coef * saliency_terms["modal_weight_loss"]
+        )
+
+        return {
+            "loss": total,
+            **fusion_terms,
+            **detection_terms,
+            **saliency_terms,
+        }

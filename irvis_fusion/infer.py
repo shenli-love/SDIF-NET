@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader
 
 from .data import M3FDDataset, detection_collate
-from .models import IRVISFusionDetectionNet
+from .models import IRVISFusionDetectionNetV2
 from .utils.config import load_flat_yaml_config
 
 
@@ -132,7 +132,7 @@ def save_detection_txt(path: Path, result: dict[str, torch.Tensor], conf_thresho
 @torch.no_grad()
 def infer_single_image_pair(
     args: argparse.Namespace,
-    model: IRVISFusionDetectionNet,
+    model: IRVISFusionDetectionNetV2,
     device: torch.device,
 ) -> None:
     if args.ir_image is None or args.vis_image is None:
@@ -158,12 +158,13 @@ def infer_single_image_pair(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    model = IRVISFusionDetectionNet(
+    model = IRVISFusionDetectionNetV2(
         num_classes=args.num_classes,
         resnet_base_channels=args.resnet_base_channels,
         fpn_channels=args.fpn_channels,
         anchor_sizes=tuple(args.anchor_sizes),
         anchor_ratios=tuple(args.anchor_ratios),
+        use_feedback_loop=False,  # 推理时禁用反馈回路
     ).to(device)
     load_checkpoint(model, args.checkpoint, device)
     model.eval()
